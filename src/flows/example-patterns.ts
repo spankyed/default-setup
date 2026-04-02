@@ -1,4 +1,4 @@
-import type { FlowDSL } from '../src/types';
+import type { FlowDSL } from '../types';
 import { entryTrack, branch, modeTracks, action, fire, subflow } from './_patterns';
 
 export default {

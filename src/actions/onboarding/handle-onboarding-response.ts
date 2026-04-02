@@ -1,4 +1,4 @@
-import type { ActionMeta, EntityId, Services, Z } from '../../src/types';
+import type { ActionMeta, EntityId, Services, Z } from '../../types';
 import { getOnboardingState, markTaskCompleted, type OnboardingState } from './onboarding-helpers';
 import { handleNameStep } from './steps/handle-name-step';
 import { handleTechLevelStep } from './steps/handle-tech-level-step';

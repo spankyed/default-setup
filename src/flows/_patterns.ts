@@ -1,4 +1,4 @@
-import type { Track, DSLStepNode, DSLSwitchCondition } from '../src/types';
+import type { Track, DSLStepNode, DSLSwitchCondition } from '../types';
 
 /** Standard flow.entry track with optional steps (single exit) */
 export function entryTrack(steps: DSLStepNode[]): Track {

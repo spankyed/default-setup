@@ -1,4 +1,4 @@
-import type { ActionMeta, Services, Z } from '../src/types';
+import type { ActionMeta, Services, Z } from '../types';
 import { buildButtonsWithDeploymentState, buildMockLinks, simulateDeployment } from './mock-block-helpers';
 
 export const meta: ActionMeta = {

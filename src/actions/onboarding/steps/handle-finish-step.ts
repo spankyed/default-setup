@@ -1,4 +1,4 @@
-import type { EntityId, Services } from '../../../src/types';
+import type { EntityId, Services } from '../../../types';
 import { finishOnboarding, type OnboardingState } from '../onboarding-helpers';
 
 export function handleFinishStep(

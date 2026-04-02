@@ -9,6 +9,6 @@
     "noEmit": true
   },
   "include": [
-    "src/**/*.ts", "defs/**/*.ts"
+    "src/**/*.ts", "build/**/*.ts", "defs/**/*.ts"
   ]
 }

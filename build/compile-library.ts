@@ -4,7 +4,7 @@ import type { ExportedItem, ExportedLibrary } from '../defs/library-export-types
 import { toTitleCase, countDocs } from '../defs/library-utils'
 
 const ROOT = path.resolve(import.meta.dirname, '..')
-const LIBRARY_DIR = path.join(ROOT, 'library')
+const LIBRARY_DIR = path.join(ROOT, 'src', 'library')
 const COMPILED_DIR = path.join(ROOT, 'compiled')
 const OUTPUT_FILE = path.join(COMPILED_DIR, 'compiled-library.json')
 

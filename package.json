@@ -4,10 +4,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "compile:actions": "tsx src/compile.ts actions",
-    "compile:prompts": "tsx src/compile.ts prompts",
-    "compile:flows": "tsx src/compile.ts flows",
-    "compile:library": "tsx src/compile-library.ts",
+    "compile:actions": "tsx build/compile.ts actions",
+    "compile:prompts": "tsx build/compile.ts prompts",
+    "compile:flows": "tsx build/compile.ts flows",
+    "compile:library": "tsx build/compile-library.ts",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

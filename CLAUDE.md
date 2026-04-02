@@ -1,16 +1,17 @@
 # Default — Quick Reference
 
-Source `.ts` files in `actions/`, `prompts/`, `flows/` are compiled via esbuild into JSON (`compiled/`) for runtime execution. Function bodies are extracted and run in a sandboxed scope — there is no module system at runtime.
+Source `.ts` files in `src/actions/`, `src/prompts/`, `src/flows/` are compiled via esbuild into JSON (`compiled/`) for runtime execution. Function bodies are extracted and run in a sandboxed scope — there is no module system at runtime.
 
 ## Directory structure
 
-- `actions/` — action source files
-- `prompts/` — prompt template source files
-- `flows/` — flow DSL files (dynamically imported, not bundled)
-- `library/` — markdown docs compiled to JSON
-- `compiled/` — generated output (**do not edit**, gitignored)
-- `shared/` — cross-cutting helpers
+- `src/actions/` — action source files
+- `src/prompts/` — prompt template source files
+- `src/flows/` — flow DSL files (dynamically imported, not bundled)
+- `src/library/` — markdown docs compiled to JSON
+- `src/shared/` — cross-cutting helpers
 - `src/types.ts` — shared type definitions (`ActionMeta`, `PromptMeta`, `Services`, `Z`, etc.)
+- `build/` — compile scripts (compile.ts, compile-utils.ts, compile-flows.ts, compile-library.ts)
+- `compiled/` — generated output (**do not edit**, gitignored)
 - `defs/` — vendored type definitions from AgentBuddy (update when upstream changes)
 
 ## Hard rules (compiler-enforced)
@@ -23,20 +24,20 @@ Source `.ts` files in `actions/`, `prompts/`, `flows/` are compiled via esbuild 
 ## Action conventions
 
 - Export `meta: ActionMeta` and `async function action(params, services, z, flowId)`
-- Import types: `import type { ActionMeta, Services, Z } from '../src/types'`
+- Import types: `import type { ActionMeta, Services, Z } from '../types'`
 - See `WRITING-ACTIONS.md` for full reference (services list, examples, metadata schema)
 
 ## Prompt conventions
 
 - Export `meta: PromptMeta` and `function template(params, usePrompt)` (synchronous, returns string)
-- Import types: `import type { PromptMeta } from '../src/types'`
+- Import types: `import type { PromptMeta } from '../types'`
 - See `WRITING-PROMPTS.md` for full reference
 
 ## Helper files
 
 - Any `.ts` file without `export const meta` is auto-detected as a helper
 - Helpers are inlined into the consuming action/prompt at compile time via esbuild
-- Can live in `actions/`, `prompts/`, `shared/`, or subdirectories
+- Can live in `src/actions/`, `src/prompts/`, `src/shared/`, or subdirectories
 
 ## Flow conventions
 

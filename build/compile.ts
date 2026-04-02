@@ -4,14 +4,14 @@ import { compileLibrary } from './compile-library';
 
 const configs: Record<string, CompileConfig> = {
   actions: {
-    sourceDir: 'actions',
+    sourceDir: 'src/actions',
     outputFile: 'compiled/compiled-actions.json',
     functionName: 'action',
     isAsync: true,
     fields: { metaInput: 'input', fnBody: 'actionFn', output: 'output' },
   },
   prompts: {
-    sourceDir: 'prompts',
+    sourceDir: 'src/prompts',
     outputFile: 'compiled/compiled-prompts.json',
     functionName: 'template',
     isAsync: false,

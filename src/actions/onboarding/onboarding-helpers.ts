@@ -1,4 +1,4 @@
-import type { EntityId, Services } from '../../src/types';
+import type { EntityId, Services } from '../../types';
 
 export const DEFAULT_NAME = 'Kathy';
 

@@ -1,4 +1,4 @@
-import type { PromptMeta } from '../src/types';
+import type { PromptMeta } from '../types';
 
 export const meta: PromptMeta = {
   label: 'Summarize Text',

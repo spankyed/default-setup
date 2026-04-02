@@ -1,4 +1,4 @@
-import type { ActionMeta, Services, Z } from '../src/types';
+import type { ActionMeta, Services, Z } from '../types';
 
 export const meta: ActionMeta = {
   label: 'db query',

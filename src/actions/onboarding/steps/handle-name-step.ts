@@ -1,4 +1,4 @@
-import type { EntityId, Services } from '../../../src/types';
+import type { EntityId, Services } from '../../../types';
 import { DEFAULT_NAME, TECH_LEVELS, type OnboardingState } from '../onboarding-helpers';
 
 export function handleNameStep(
