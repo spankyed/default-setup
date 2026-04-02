@@ -98,7 +98,7 @@ For generated defs (Services, PromptService):
 ```bash
 cd /path/to/AgentBuddy/packages/api
 npm run generate:defs-types
-cp defs/dist/scratchpad/*.d.ts /path/to/default-setup/defs/
+cp defs/dist/default/*.d.ts /path/to/default-setup/defs/
 ```
 
 For hand-extracted defs (EARS, FlowDSL, library, thread types): manually update from the source files listed in the defs/ section above.
