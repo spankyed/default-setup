@@ -11,7 +11,7 @@ Source files live in `default/actions/` and are compiled to JSON via `npm run co
 1. Create a new `.ts` file in `default/actions/`
 2. Export a `meta` object and an `action` function
 3. Run `npm run compile:actions`
-4. Import the generated `compiled-actions.json` via the app UI (IMPORT_ACTIONS)
+4. Import the generated `dist/compiled-actions.json` via the app UI (IMPORT_ACTIONS)
 
 ## Template
 
@@ -248,6 +248,6 @@ Run from the project root or `packages/api/`:
 npm run compile:actions
 ```
 
-This uses esbuild to bundle and transpile all `.ts` files in `default/actions/`, resolving relative imports and inlining helper code. It then extracts the function body and metadata and writes `default/actions/compiled-actions.json`. Files without `export const meta` are treated as helper files and skipped during compilation (but can be imported by action files).
+This uses esbuild to bundle and transpile all `.ts` files in `default/actions/`, resolving relative imports and inlining helper code. It then extracts the function body and metadata and writes `dist/compiled-actions.json`. Files without `export const meta` are treated as helper files and skipped during compilation (but can be imported by action files).
 
 The compiled JSON is git-tracked and can be imported via the app UI using the existing IMPORT_ACTIONS flow.

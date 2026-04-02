@@ -1,6 +1,6 @@
 # Default — Quick Reference
 
-Source `.ts` files in `src/actions/`, `src/prompts/`, `src/flows/` are compiled via esbuild into JSON (`compiled/`) for runtime execution. Function bodies are extracted and run in a sandboxed scope — there is no module system at runtime.
+Source `.ts` files in `src/actions/`, `src/prompts/`, `src/flows/` are compiled via esbuild into JSON (`dist/`) for runtime execution. Function bodies are extracted and run in a sandboxed scope — there is no module system at runtime.
 
 ## Directory structure
 
@@ -11,7 +11,7 @@ Source `.ts` files in `src/actions/`, `src/prompts/`, `src/flows/` are compiled 
 - `src/shared/` — cross-cutting helpers
 - `src/types.ts` — shared type definitions (`ActionMeta`, `PromptMeta`, `Services`, `Z`, etc.)
 - `build/` — compile scripts (compile.ts, compile-utils.ts, compile-flows.ts, compile-library.ts)
-- `compiled/` — generated output (**do not edit**, gitignored)
+- `dist/` — generated output (**do not edit**, gitignored)
 - `defs/` — vendored type definitions from AgentBuddy (update when upstream changes)
 
 ## Hard rules (compiler-enforced)

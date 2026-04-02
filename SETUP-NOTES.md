@@ -31,7 +31,7 @@ default-setup/
   flows/                    # Flow DSL files
   library/                  # Markdown docs + media
   shared/                   # Cross-cutting helpers (empty for now)
-  compiled/                 # Generated JSON output (gitignored)
+  dist/                 # Generated JSON output (gitignored)
 ```
 
 ### Import rewiring
@@ -73,7 +73,7 @@ npm run compile:flows
 npm run compile:library
 
 # Copy back to AgentBuddy
-cp -r compiled/* /path/to/AgentBuddy/packages/api/default/compiled/
+cp -r dist/* /path/to/AgentBuddy/packages/api/default/dist/
 ```
 
 ### Update vendored defs when AgentBuddy types change
@@ -89,7 +89,7 @@ For hand-extracted defs (EARS, FlowDSL, library, thread types): manually update 
 
 ## Still in AgentBuddy (not removed yet)
 
-The original `packages/api/default/` directory remains in AgentBuddy as a fallback. Once this standalone repo is fully validated, the source content and compilers can be removed from AgentBuddy — keeping only `default/compiled/` as the landing zone for manually-copied output.
+The original `packages/api/default/` directory remains in AgentBuddy as a fallback. Once this standalone repo is fully validated, the source content and compilers can be removed from AgentBuddy — keeping only `default/dist/` as the landing zone for manually-copied output.
 
 ## Known issues
 

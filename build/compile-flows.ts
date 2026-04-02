@@ -5,7 +5,7 @@ import { validate } from '../defs/flow-dsl-validator';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 const FLOWS_DIR = path.join(ROOT, 'src', 'flows');
-const OUTPUT_FILE = path.join(ROOT, 'compiled', 'compiled-flows.json');
+const OUTPUT_FILE = path.join(ROOT, 'dist', 'compiled-flows.json');
 
 export async function compileFlows(): Promise<void> {
   console.log(`Compiling flows from: ${FLOWS_DIR}`);

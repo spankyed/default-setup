@@ -11,7 +11,7 @@ Source files live in `default/prompts/` and are compiled to JSON via `npm run co
 1. Create a new `.ts` file in `default/prompts/`
 2. Export a `meta` object and a `template` function
 3. Run `npm run compile:prompts`
-4. Import the generated `compiled-prompts.json` via the app UI (IMPORT_PROMPTS)
+4. Import the generated `dist/compiled-prompts.json` via the app UI (IMPORT_PROMPTS)
 
 ## Template
 
@@ -258,6 +258,6 @@ Run from the project root or `packages/api/`:
 npm run compile:prompts
 ```
 
-This uses esbuild to bundle and transpile all `.ts` files in `default/prompts/`, resolving relative imports and inlining helper code. It then extracts the function body and metadata and writes `default/prompts/compiled-prompts.json`. Files without `export const meta` are treated as helper files and skipped during compilation (but can be imported by prompt files).
+This uses esbuild to bundle and transpile all `.ts` files in `default/prompts/`, resolving relative imports and inlining helper code. It then extracts the function body and metadata and writes `dist/compiled-prompts.json`. Files without `export const meta` are treated as helper files and skipped during compilation (but can be imported by prompt files).
 
 The compiled JSON is git-tracked and can be imported via the app UI using the existing IMPORT_PROMPTS flow.
