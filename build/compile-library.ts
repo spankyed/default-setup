@@ -64,6 +64,3 @@ export function compileLibrary(): void {
   const docCount = countDocs(items)
   console.log(`\nWrote ${docCount} library doc(s) to ${path.relative(process.cwd(), OUTPUT_FILE)}`)
 }
-
-// Run directly
-compileLibrary()
