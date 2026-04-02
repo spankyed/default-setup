@@ -19,5 +19,5 @@ if [ ! -d "$AGENTBUDDY_ROOT/packages/api" ]; then
 fi
 
 AB_API="$AGENTBUDDY_ROOT/packages/api"
-AB_DEFS_OUT="$AB_API/defs/dist/scratchpad"
+AB_DEFS_OUT="$AB_API/defs/dist/default-setup"
 AB_SEED_DATA="$AB_API/src/setup/seed/data"
