@@ -2,6 +2,38 @@
 
 Source `.ts` files in `src/actions/`, `src/prompts/`, `src/flows/` are compiled via esbuild into JSON (`dist/`) for runtime execution. Function bodies are extracted and run in a sandboxed scope — there is no module system at runtime.
 
+
+### New repo structure
+
+```
+default-setup/
+  defs/                     # Vendored definitions from AgentBuddy
+    ears-types.ts           # EARS Entity, EntityId, RelKind (from src/core/types.ts)
+    flow-dsl-types.ts       # FlowDSL, Track, DSLStepNode types (from src/systems/flows/dsl/types.ts)
+    flow-dsl-validator.ts   # validate() function (from src/systems/flows/dsl/validator.ts)
+    library-types.ts        # ContentSection union (from src/systems/library/types.ts)
+    library-export-types.ts # ExportedItem, ExportedLibrary (from src/systems/library/export-types.ts)
+    library-utils.ts        # toTitleCase, countDocs (from src/systems/library/utils.ts)
+    thread-types.ts         # ButtonConfig, LinkConfig (from src/systems/threads/types.ts)
+    action-defs.d.ts        # Generated: full Services type, z, ActionEntity (from rollup pipeline)
+    prompt-defs.d.ts        # Generated: PromptService, usePrompt, PromptContext (from rollup pipeline)
+
+  src/                      # Compiler infrastructure (moved from default root)
+    compile.ts              # Entry point — dispatches to action/prompt/flow/library compilers
+    compile-utils.ts        # esbuild bundling, TS AST extraction, validation
+    compile-flows.ts        # Flow compiler — dynamic import + validation
+    compile-library.ts      # Library markdown compiler
+    types.ts                # Re-exports types from defs/ for action/prompt/flow authoring
+
+  actions/                  # Action source files (copied as-is, imports updated)
+  prompts/                  # Prompt template source files
+  flows/                    # Flow DSL files
+  library/                  # Markdown docs + media
+  shared/                   # Cross-cutting helpers (empty for now)
+  dist/                 # Generated JSON output (gitignored)
+```
+
+
 ## Directory structure
 
 - `src/actions/` — action source files
@@ -59,3 +91,14 @@ Source `.ts` files in `src/actions/`, `src/prompts/`, `src/flows/` are compiled 
 - `npm run compile:flows` — compile flows to JSON
 - `npm run compile:library` — compile library markdown to JSON
 - `npm run typecheck` — type check all source files
+
+### Update vendored defs when AgentBuddy types change
+
+For generated defs (Services, PromptService):
+```bash
+cd /path/to/AgentBuddy/packages/api
+npm run generate:defs-types
+cp defs/dist/scratchpad/*.d.ts /path/to/default-setup/defs/
+```
+
+For hand-extracted defs (EARS, FlowDSL, library, thread types): manually update from the source files listed in the defs/ section above.

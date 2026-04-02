@@ -7,7 +7,11 @@
     "compile:actions": "tsx build/compile.ts actions",
     "compile:prompts": "tsx build/compile.ts prompts",
     "compile:flows": "tsx build/compile.ts flows",
-    "compile:library": "tsx build/compile-library.ts",
+    "compile:library": "tsx build/compile.ts library",
+    "compile:all": "npm run compile:actions && npm run compile:prompts && npm run compile:flows && npm run compile:library",
+    "sync:defs": "bash scripts/sync-defs.sh",
+    "sync:seed": "bash scripts/sync-seed.sh",
+    "pipeline": "bash scripts/pipeline.sh",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
