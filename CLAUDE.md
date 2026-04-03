@@ -97,7 +97,7 @@ After compiling, import `dist/` via AgentBuddy Settings → Import Setup Pack.
 
 ### Updating defs
 
-Type definitions in `defs/` are pushed from the AgentBuddy monorepo via `sync:external`. Run from monorepo root:
+Type definitions in `defs/` are generated automatically during `npm run build:be` (via the API's `postbuild` step). To sync to the external repo:
 ```bash
 npm run sync:external --workspace @app/default-setup
 ```
