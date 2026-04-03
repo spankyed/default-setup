@@ -83,11 +83,17 @@ default-setup/
 
 ## Commands
 
+- `npm run compile:all` — compile all targets (actions, prompts, flows, library, notes)
 - `npm run compile:actions` — compile actions to JSON
 - `npm run compile:prompts` — compile prompts to JSON
 - `npm run compile:flows` — compile flows to JSON
 - `npm run compile:library` — compile library markdown to JSON
 - `npm run typecheck` — type check all source files
+- `npm run pipeline` — sync defs from AgentBuddy + compile all targets
+
+## Importing compiled output into AgentBuddy
+
+After compiling, import `dist/` via AgentBuddy Settings → Import Setup Pack. This imports all artifacts (actions, prompts, flows, library, notes) in one step.
 
 ### Regenerate defs when API types change
 
