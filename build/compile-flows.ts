@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import * as crypto from 'crypto';
 import type { FlowDSL } from '../src/types';
 import { isFlowConfig } from './flow-dsl-utils';
 import { validate } from './flow-dsl-validator';
@@ -12,8 +13,11 @@ export async function compileFlows(): Promise<void> {
   console.log(`Compiling flows from: ${FLOWS_DIR}`);
 
   if (!fs.existsSync(FLOWS_DIR)) {
-    console.error('Flows directory not found:', FLOWS_DIR);
-    process.exit(1);
+    console.log(`Flows directory not found: ${FLOWS_DIR}`);
+    console.log(`\nWrote 0 flow(s) to dist/compiled-flows.json\n`);
+    fs.mkdirSync(path.dirname(OUTPUT_FILE), { recursive: true });
+    fs.writeFileSync(OUTPUT_FILE, JSON.stringify([], null, 2));
+    return;
   }
 
   const tsFiles = fs.readdirSync(FLOWS_DIR)
@@ -85,9 +89,20 @@ export async function compileFlows(): Promise<void> {
     process.exit(1);
   }
 
+  // Normalize all entries to FlowConfig and embed per-flow source hashes.
+  const hashed: Record<string, object> = {};
+  for (const [name, entry] of Object.entries(merged)) {
+    const config = isFlowConfig(entry) ? entry : { tracks: entry };
+    const sourceHash = crypto.createHash('sha256')
+      .update(JSON.stringify({ tracks: config.tracks, root: (config as any).root }))
+      .digest('hex')
+      .slice(0, 16);
+    hashed[name] = { ...config, sourceHash };
+  }
+
   fs.mkdirSync(path.dirname(OUTPUT_FILE), { recursive: true });
-  fs.writeFileSync(OUTPUT_FILE, JSON.stringify(merged, null, 2) + '\n');
-  console.log(`\nWrote ${Object.keys(merged).length} flow(s) from ${loaded} file(s) to ${path.relative(process.cwd(), OUTPUT_FILE)}`);
+  fs.writeFileSync(OUTPUT_FILE, JSON.stringify(hashed, null, 2) + '\n');
+  console.log(`\nWrote ${Object.keys(hashed).length} flow(s) from ${loaded} file(s) to ${path.relative(process.cwd(), OUTPUT_FILE)}`);
 }
 
 function loadLabels(filePath: string): string[] {

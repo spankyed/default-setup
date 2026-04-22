@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import * as crypto from 'crypto';
 import ts from 'typescript';
 import * as esbuild from 'esbuild';
 
@@ -268,7 +269,13 @@ async function compileSourceFile(
     ...(meta[config.fields.output] && { [config.fields.output]: meta[config.fields.output] }),
   };
 
-  return { entry: compiled, warnings };
+  // Compute per-item sourceHash so the seed logic can detect DSL changes
+  const sourceHash = crypto.createHash('sha256')
+    .update(JSON.stringify(compiled))
+    .digest('hex')
+    .slice(0, 16);
+
+  return { entry: { ...compiled, sourceHash }, warnings };
 }
 
 // --- Main compilation loop ---
@@ -281,8 +288,11 @@ export async function compileAllSourceFiles(config: CompileConfig): Promise<void
   console.log(`Compiling from: ${sourceDir}`);
 
   if (!fs.existsSync(sourceDir)) {
-    console.error('Source directory not found:', sourceDir);
-    process.exit(1);
+    console.log(`Source directory not found: ${sourceDir}`);
+    console.log(`\nWrote 0 entries to ${config.outputFile}\n`);
+    fs.mkdirSync(path.dirname(outputFile), { recursive: true });
+    fs.writeFileSync(outputFile, JSON.stringify([], null, 2));
+    return;
   }
 
   const { sourceFiles, helperFiles } = scanSourceFiles(sourceDir);

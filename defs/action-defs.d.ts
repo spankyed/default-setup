@@ -5,13 +5,25 @@ import * as ai from 'ai';
 import { CoreMessage } from 'ai';
 import { BrowserType, ElementHandle, Page, Browser, BrowserContext, chromium, firefox, webkit } from 'playwright';
 
-interface TextStreamOptions {
-    chunkSize?: number;
-    delayMs?: number;
+interface FileEntry {
+    name: string;
+    isDirectory: boolean;
 }
-declare class TextStreamService {
-    streamText(text: string, options?: TextStreamOptions): AsyncGenerator<string, void, unknown>;
-    streamTextByChars(text: string, options?: TextStreamOptions): AsyncGenerator<string, void, unknown>;
+interface FileStat {
+    size: number;
+    mtime: Date;
+    isDirectory: boolean;
+    isFile: boolean;
+}
+interface FilesystemServiceType {
+    writeFile(filePath: string, content: string): Promise<void>;
+    readFile(filePath: string): Promise<string>;
+    exists(filePath: string): Promise<boolean>;
+    mkdir(dirPath: string): Promise<void>;
+    readDir(dirPath: string): Promise<FileEntry[]>;
+    remove(targetPath: string): Promise<void>;
+    rename(oldPath: string, newPath: string): Promise<void>;
+    stat(filePath: string): Promise<FileStat>;
 }
 
 declare namespace EARS {
@@ -121,6 +133,14 @@ interface BaseEntity {
     updatedAt?: number;
 }
 
+type TokenSource = 'GITHUB_TOKEN' | 'keyring' | 'unknown';
+type TokenKind = 'fine-grained-pat' | 'classic-pat' | 'oauth' | 'unknown';
+interface ActiveTokenInfo {
+    source: TokenSource;
+    kind: TokenKind;
+    prefix: string;
+}
+
 interface FileChangeInfo {
     path: string;
     modifiedAt: Date;
@@ -167,6 +187,7 @@ interface SeedResult {
     flows: SeedCounts;
     library: SeedCounts;
     notes: SeedCounts;
+    settings: SeedCounts;
 }
 
 type Simplify<T> = {
@@ -211,6 +232,7 @@ interface NoteDTO {
     updatedAt: number;
     lastSeen: number;
     favorite: boolean;
+    deletedAt?: number;
 }
 interface NotesConnectedData {
     notes: NoteDTO[];
@@ -244,6 +266,8 @@ interface PromptEntity extends BaseEntity {
     inputs: Record<string, TemplateInput>;
     templateFn: string;
     outputSchema?: any;
+    /** SHA256 hash of DSL source at last seed. Absent on user-created prompts. */
+    sourceHash?: string;
     createdAt: number;
     updatedAt: number;
 }
@@ -318,6 +342,8 @@ interface ActionEntity {
     input: Record<string, ActionParameter>;
     actionFn: string;
     output?: any;
+    /** SHA256 hash of DSL source at last seed. Absent on user-created actions. */
+    sourceHash?: string;
     createdAt: number;
     updatedAt: number;
 }
@@ -329,7 +355,641 @@ interface ActionsStartupData {
     categories?: Category[];
 }
 
-type BlockType = 'prompt' | 'note' | 'file-picker' | 'choice' | 'text' | 'approval' | 'actions' | 'link' | 'button-group';
+/**
+ * Type definitions + Zod schemas for the Claude Code stream-json wire protocol.
+ *
+ * The CLI is fast-moving and routinely adds fields; every object schema uses
+ * `.passthrough()` so unknown fields survive round-trips and we only validate
+ * the bits we actually read. Inferred TS types are exported next to each schema.
+ *
+ * Source of truth for field shapes: the stream-json writer at
+ * `src/cli/structuredIO.ts` and the SDK Zod schemas at
+ * `src/entrypoints/sdk/coreSchemas.ts` in the leaked Claude Code source.
+ */
+
+/**
+ * Permission modes accepted by `claude --permission-mode`. Names match the
+ * CLI's Commander validator exactly (see the leaked source at
+ * `src/types/permissions.ts` or the error message the CLI prints when you
+ * pass an unknown value).
+ *
+ * Interoperation note: only `default`, `plan`, and `acceptEdits` emit
+ * `can_use_tool` control_requests that our wrapper's `onPermissionRequest`
+ * hook can intercept. `bypassPermissions` and `dontAsk` short-circuit the
+ * permission resolver entirely; `auto` is feature-gated and uses an ML
+ * classifier instead of prompting.
+ */
+declare const PermissionModeSchema: z.ZodEnum<["default", "acceptEdits", "plan", "bypassPermissions", "dontAsk", "auto"]>;
+type PermissionMode = z.infer<typeof PermissionModeSchema>;
+declare const ThinkingSchema: z.ZodEnum<["enabled", "adaptive", "disabled"]>;
+type Thinking = z.infer<typeof ThinkingSchema>;
+declare const EffortSchema: z.ZodEnum<["low", "medium", "high", "max"]>;
+type Effort = z.infer<typeof EffortSchema>;
+declare const SettingScopeSchema: z.ZodEnum<["user", "project", "local"]>;
+type SettingScope = z.infer<typeof SettingScopeSchema>;
+/** `{type:'user', message:{role:'user', content:...}}` — replayed user turn. */
+declare const UserStreamLineSchema: z.ZodObject<{
+    uuid: z.ZodOptional<z.ZodString>;
+    session_id: z.ZodOptional<z.ZodString>;
+} & {
+    type: z.ZodLiteral<"user">;
+    message: z.ZodObject<{
+        role: z.ZodLiteral<"user">;
+        content: z.ZodUnion<[z.ZodString, z.ZodArray<z.ZodAny, "many">]>;
+    }, "passthrough", z.ZodTypeAny, z.objectOutputType<{
+        role: z.ZodLiteral<"user">;
+        content: z.ZodUnion<[z.ZodString, z.ZodArray<z.ZodAny, "many">]>;
+    }, z.ZodTypeAny, "passthrough">, z.objectInputType<{
+        role: z.ZodLiteral<"user">;
+        content: z.ZodUnion<[z.ZodString, z.ZodArray<z.ZodAny, "many">]>;
+    }, z.ZodTypeAny, "passthrough">>;
+    parent_tool_use_id: z.ZodOptional<z.ZodNullable<z.ZodString>>;
+    isReplay: z.ZodOptional<z.ZodBoolean>;
+    isSynthetic: z.ZodOptional<z.ZodBoolean>;
+}, "passthrough", z.ZodTypeAny, z.objectOutputType<{
+    uuid: z.ZodOptional<z.ZodString>;
+    session_id: z.ZodOptional<z.ZodString>;
+} & {
+    type: z.ZodLiteral<"user">;
+    message: z.ZodObject<{
+        role: z.ZodLiteral<"user">;
+        content: z.ZodUnion<[z.ZodString, z.ZodArray<z.ZodAny, "many">]>;
+    }, "passthrough", z.ZodTypeAny, z.objectOutputType<{
+        role: z.ZodLiteral<"user">;
+        content: z.ZodUnion<[z.ZodString, z.ZodArray<z.ZodAny, "many">]>;
+    }, z.ZodTypeAny, "passthrough">, z.objectInputType<{
+        role: z.ZodLiteral<"user">;
+        content: z.ZodUnion<[z.ZodString, z.ZodArray<z.ZodAny, "many">]>;
+    }, z.ZodTypeAny, "passthrough">>;
+    parent_tool_use_id: z.ZodOptional<z.ZodNullable<z.ZodString>>;
+    isReplay: z.ZodOptional<z.ZodBoolean>;
+    isSynthetic: z.ZodOptional<z.ZodBoolean>;
+}, z.ZodTypeAny, "passthrough">, z.objectInputType<{
+    uuid: z.ZodOptional<z.ZodString>;
+    session_id: z.ZodOptional<z.ZodString>;
+} & {
+    type: z.ZodLiteral<"user">;
+    message: z.ZodObject<{
+        role: z.ZodLiteral<"user">;
+        content: z.ZodUnion<[z.ZodString, z.ZodArray<z.ZodAny, "many">]>;
+    }, "passthrough", z.ZodTypeAny, z.objectOutputType<{
+        role: z.ZodLiteral<"user">;
+        content: z.ZodUnion<[z.ZodString, z.ZodArray<z.ZodAny, "many">]>;
+    }, z.ZodTypeAny, "passthrough">, z.objectInputType<{
+        role: z.ZodLiteral<"user">;
+        content: z.ZodUnion<[z.ZodString, z.ZodArray<z.ZodAny, "many">]>;
+    }, z.ZodTypeAny, "passthrough">>;
+    parent_tool_use_id: z.ZodOptional<z.ZodNullable<z.ZodString>>;
+    isReplay: z.ZodOptional<z.ZodBoolean>;
+    isSynthetic: z.ZodOptional<z.ZodBoolean>;
+}, z.ZodTypeAny, "passthrough">>;
+type UserStreamLine = z.infer<typeof UserStreamLineSchema>;
+/** `{type:'assistant', message:{role:'assistant', content:[...blocks]}}` */
+declare const AssistantStreamLineSchema: z.ZodObject<{
+    uuid: z.ZodOptional<z.ZodString>;
+    session_id: z.ZodOptional<z.ZodString>;
+} & {
+    type: z.ZodLiteral<"assistant">;
+    message: z.ZodObject<{
+        role: z.ZodLiteral<"assistant">;
+        content: z.ZodArray<z.ZodAny, "many">;
+    }, "passthrough", z.ZodTypeAny, z.objectOutputType<{
+        role: z.ZodLiteral<"assistant">;
+        content: z.ZodArray<z.ZodAny, "many">;
+    }, z.ZodTypeAny, "passthrough">, z.objectInputType<{
+        role: z.ZodLiteral<"assistant">;
+        content: z.ZodArray<z.ZodAny, "many">;
+    }, z.ZodTypeAny, "passthrough">>;
+    parent_tool_use_id: z.ZodOptional<z.ZodNullable<z.ZodString>>;
+    error: z.ZodOptional<z.ZodObject<{
+        type: z.ZodString;
+        message: z.ZodString;
+    }, "passthrough", z.ZodTypeAny, z.objectOutputType<{
+        type: z.ZodString;
+        message: z.ZodString;
+    }, z.ZodTypeAny, "passthrough">, z.objectInputType<{
+        type: z.ZodString;
+        message: z.ZodString;
+    }, z.ZodTypeAny, "passthrough">>>;
+}, "passthrough", z.ZodTypeAny, z.objectOutputType<{
+    uuid: z.ZodOptional<z.ZodString>;
+    session_id: z.ZodOptional<z.ZodString>;
+} & {
+    type: z.ZodLiteral<"assistant">;
+    message: z.ZodObject<{
+        role: z.ZodLiteral<"assistant">;
+        content: z.ZodArray<z.ZodAny, "many">;
+    }, "passthrough", z.ZodTypeAny, z.objectOutputType<{
+        role: z.ZodLiteral<"assistant">;
+        content: z.ZodArray<z.ZodAny, "many">;
+    }, z.ZodTypeAny, "passthrough">, z.objectInputType<{
+        role: z.ZodLiteral<"assistant">;
+        content: z.ZodArray<z.ZodAny, "many">;
+    }, z.ZodTypeAny, "passthrough">>;
+    parent_tool_use_id: z.ZodOptional<z.ZodNullable<z.ZodString>>;
+    error: z.ZodOptional<z.ZodObject<{
+        type: z.ZodString;
+        message: z.ZodString;
+    }, "passthrough", z.ZodTypeAny, z.objectOutputType<{
+        type: z.ZodString;
+        message: z.ZodString;
+    }, z.ZodTypeAny, "passthrough">, z.objectInputType<{
+        type: z.ZodString;
+        message: z.ZodString;
+    }, z.ZodTypeAny, "passthrough">>>;
+}, z.ZodTypeAny, "passthrough">, z.objectInputType<{
+    uuid: z.ZodOptional<z.ZodString>;
+    session_id: z.ZodOptional<z.ZodString>;
+} & {
+    type: z.ZodLiteral<"assistant">;
+    message: z.ZodObject<{
+        role: z.ZodLiteral<"assistant">;
+        content: z.ZodArray<z.ZodAny, "many">;
+    }, "passthrough", z.ZodTypeAny, z.objectOutputType<{
+        role: z.ZodLiteral<"assistant">;
+        content: z.ZodArray<z.ZodAny, "many">;
+    }, z.ZodTypeAny, "passthrough">, z.objectInputType<{
+        role: z.ZodLiteral<"assistant">;
+        content: z.ZodArray<z.ZodAny, "many">;
+    }, z.ZodTypeAny, "passthrough">>;
+    parent_tool_use_id: z.ZodOptional<z.ZodNullable<z.ZodString>>;
+    error: z.ZodOptional<z.ZodObject<{
+        type: z.ZodString;
+        message: z.ZodString;
+    }, "passthrough", z.ZodTypeAny, z.objectOutputType<{
+        type: z.ZodString;
+        message: z.ZodString;
+    }, z.ZodTypeAny, "passthrough">, z.objectInputType<{
+        type: z.ZodString;
+        message: z.ZodString;
+    }, z.ZodTypeAny, "passthrough">>>;
+}, z.ZodTypeAny, "passthrough">>;
+type AssistantStreamLine = z.infer<typeof AssistantStreamLineSchema>;
+/** `{type:'stream_event', event:{...}}` — partial message chunks. */
+declare const StreamEventLineSchema: z.ZodObject<{
+    uuid: z.ZodOptional<z.ZodString>;
+    session_id: z.ZodOptional<z.ZodString>;
+} & {
+    type: z.ZodLiteral<"stream_event">;
+    event: z.ZodObject<{
+        type: z.ZodString;
+    }, "passthrough", z.ZodTypeAny, z.objectOutputType<{
+        type: z.ZodString;
+    }, z.ZodTypeAny, "passthrough">, z.objectInputType<{
+        type: z.ZodString;
+    }, z.ZodTypeAny, "passthrough">>;
+    parent_tool_use_id: z.ZodOptional<z.ZodNullable<z.ZodString>>;
+}, "passthrough", z.ZodTypeAny, z.objectOutputType<{
+    uuid: z.ZodOptional<z.ZodString>;
+    session_id: z.ZodOptional<z.ZodString>;
+} & {
+    type: z.ZodLiteral<"stream_event">;
+    event: z.ZodObject<{
+        type: z.ZodString;
+    }, "passthrough", z.ZodTypeAny, z.objectOutputType<{
+        type: z.ZodString;
+    }, z.ZodTypeAny, "passthrough">, z.objectInputType<{
+        type: z.ZodString;
+    }, z.ZodTypeAny, "passthrough">>;
+    parent_tool_use_id: z.ZodOptional<z.ZodNullable<z.ZodString>>;
+}, z.ZodTypeAny, "passthrough">, z.objectInputType<{
+    uuid: z.ZodOptional<z.ZodString>;
+    session_id: z.ZodOptional<z.ZodString>;
+} & {
+    type: z.ZodLiteral<"stream_event">;
+    event: z.ZodObject<{
+        type: z.ZodString;
+    }, "passthrough", z.ZodTypeAny, z.objectOutputType<{
+        type: z.ZodString;
+    }, z.ZodTypeAny, "passthrough">, z.objectInputType<{
+        type: z.ZodString;
+    }, z.ZodTypeAny, "passthrough">>;
+    parent_tool_use_id: z.ZodOptional<z.ZodNullable<z.ZodString>>;
+}, z.ZodTypeAny, "passthrough">>;
+type StreamEventLine = z.infer<typeof StreamEventLineSchema>;
+/** Tool-use progress heartbeat. */
+declare const ToolProgressLineSchema: z.ZodObject<{
+    uuid: z.ZodOptional<z.ZodString>;
+    session_id: z.ZodOptional<z.ZodString>;
+} & {
+    type: z.ZodLiteral<"tool_progress">;
+    tool_use_id: z.ZodString;
+    tool_name: z.ZodString;
+    elapsed_time_seconds: z.ZodOptional<z.ZodNumber>;
+    parent_tool_use_id: z.ZodOptional<z.ZodNullable<z.ZodString>>;
+}, "passthrough", z.ZodTypeAny, z.objectOutputType<{
+    uuid: z.ZodOptional<z.ZodString>;
+    session_id: z.ZodOptional<z.ZodString>;
+} & {
+    type: z.ZodLiteral<"tool_progress">;
+    tool_use_id: z.ZodString;
+    tool_name: z.ZodString;
+    elapsed_time_seconds: z.ZodOptional<z.ZodNumber>;
+    parent_tool_use_id: z.ZodOptional<z.ZodNullable<z.ZodString>>;
+}, z.ZodTypeAny, "passthrough">, z.objectInputType<{
+    uuid: z.ZodOptional<z.ZodString>;
+    session_id: z.ZodOptional<z.ZodString>;
+} & {
+    type: z.ZodLiteral<"tool_progress">;
+    tool_use_id: z.ZodString;
+    tool_name: z.ZodString;
+    elapsed_time_seconds: z.ZodOptional<z.ZodNumber>;
+    parent_tool_use_id: z.ZodOptional<z.ZodNullable<z.ZodString>>;
+}, z.ZodTypeAny, "passthrough">>;
+type ToolProgressLine = z.infer<typeof ToolProgressLineSchema>;
+/** System lines — many subtypes, all passthrough. */
+declare const SystemLineSchema: z.ZodObject<{
+    uuid: z.ZodOptional<z.ZodString>;
+    session_id: z.ZodOptional<z.ZodString>;
+} & {
+    type: z.ZodLiteral<"system">;
+    subtype: z.ZodString;
+}, "passthrough", z.ZodTypeAny, z.objectOutputType<{
+    uuid: z.ZodOptional<z.ZodString>;
+    session_id: z.ZodOptional<z.ZodString>;
+} & {
+    type: z.ZodLiteral<"system">;
+    subtype: z.ZodString;
+}, z.ZodTypeAny, "passthrough">, z.objectInputType<{
+    uuid: z.ZodOptional<z.ZodString>;
+    session_id: z.ZodOptional<z.ZodString>;
+} & {
+    type: z.ZodLiteral<"system">;
+    subtype: z.ZodString;
+}, z.ZodTypeAny, "passthrough">>;
+type SystemLine = z.infer<typeof SystemLineSchema>;
+/** Rate limit warnings. */
+declare const RateLimitLineSchema: z.ZodObject<{
+    uuid: z.ZodOptional<z.ZodString>;
+    session_id: z.ZodOptional<z.ZodString>;
+} & {
+    type: z.ZodLiteral<"rate_limit_event">;
+    rate_limit_info: z.ZodObject<{}, "passthrough", z.ZodTypeAny, z.objectOutputType<{}, z.ZodTypeAny, "passthrough">, z.objectInputType<{}, z.ZodTypeAny, "passthrough">>;
+}, "passthrough", z.ZodTypeAny, z.objectOutputType<{
+    uuid: z.ZodOptional<z.ZodString>;
+    session_id: z.ZodOptional<z.ZodString>;
+} & {
+    type: z.ZodLiteral<"rate_limit_event">;
+    rate_limit_info: z.ZodObject<{}, "passthrough", z.ZodTypeAny, z.objectOutputType<{}, z.ZodTypeAny, "passthrough">, z.objectInputType<{}, z.ZodTypeAny, "passthrough">>;
+}, z.ZodTypeAny, "passthrough">, z.objectInputType<{
+    uuid: z.ZodOptional<z.ZodString>;
+    session_id: z.ZodOptional<z.ZodString>;
+} & {
+    type: z.ZodLiteral<"rate_limit_event">;
+    rate_limit_info: z.ZodObject<{}, "passthrough", z.ZodTypeAny, z.objectOutputType<{}, z.ZodTypeAny, "passthrough">, z.objectInputType<{}, z.ZodTypeAny, "passthrough">>;
+}, z.ZodTypeAny, "passthrough">>;
+type RateLimitLine = z.infer<typeof RateLimitLineSchema>;
+/** Tool-use summary ("Read 2 files, wrote 1 file"). */
+declare const ToolUseSummaryLineSchema: z.ZodObject<{
+    uuid: z.ZodOptional<z.ZodString>;
+    session_id: z.ZodOptional<z.ZodString>;
+} & {
+    type: z.ZodLiteral<"tool_use_summary">;
+    summary: z.ZodString;
+    preceding_tool_use_ids: z.ZodOptional<z.ZodArray<z.ZodString, "many">>;
+}, "passthrough", z.ZodTypeAny, z.objectOutputType<{
+    uuid: z.ZodOptional<z.ZodString>;
+    session_id: z.ZodOptional<z.ZodString>;
+} & {
+    type: z.ZodLiteral<"tool_use_summary">;
+    summary: z.ZodString;
+    preceding_tool_use_ids: z.ZodOptional<z.ZodArray<z.ZodString, "many">>;
+}, z.ZodTypeAny, "passthrough">, z.objectInputType<{
+    uuid: z.ZodOptional<z.ZodString>;
+    session_id: z.ZodOptional<z.ZodString>;
+} & {
+    type: z.ZodLiteral<"tool_use_summary">;
+    summary: z.ZodString;
+    preceding_tool_use_ids: z.ZodOptional<z.ZodArray<z.ZodString, "many">>;
+}, z.ZodTypeAny, "passthrough">>;
+type ToolUseSummaryLine = z.infer<typeof ToolUseSummaryLineSchema>;
+/** Final result line — marks turn completion. */
+declare const ResultLineSchema: z.ZodObject<{
+    uuid: z.ZodOptional<z.ZodString>;
+    session_id: z.ZodOptional<z.ZodString>;
+} & {
+    type: z.ZodLiteral<"result">;
+    subtype: z.ZodString;
+    is_error: z.ZodOptional<z.ZodBoolean>;
+    duration_ms: z.ZodOptional<z.ZodNumber>;
+    duration_api_ms: z.ZodOptional<z.ZodNumber>;
+    num_turns: z.ZodOptional<z.ZodNumber>;
+    result: z.ZodOptional<z.ZodString>;
+    stop_reason: z.ZodOptional<z.ZodNullable<z.ZodString>>;
+    total_cost_usd: z.ZodOptional<z.ZodNumber>;
+    usage: z.ZodOptional<z.ZodObject<{}, "passthrough", z.ZodTypeAny, z.objectOutputType<{}, z.ZodTypeAny, "passthrough">, z.objectInputType<{}, z.ZodTypeAny, "passthrough">>>;
+    modelUsage: z.ZodOptional<z.ZodRecord<z.ZodString, z.ZodAny>>;
+    permission_denials: z.ZodOptional<z.ZodArray<z.ZodObject<{}, "passthrough", z.ZodTypeAny, z.objectOutputType<{}, z.ZodTypeAny, "passthrough">, z.objectInputType<{}, z.ZodTypeAny, "passthrough">>, "many">>;
+    structured_output: z.ZodOptional<z.ZodUnknown>;
+    errors: z.ZodOptional<z.ZodArray<z.ZodString, "many">>;
+}, "passthrough", z.ZodTypeAny, z.objectOutputType<{
+    uuid: z.ZodOptional<z.ZodString>;
+    session_id: z.ZodOptional<z.ZodString>;
+} & {
+    type: z.ZodLiteral<"result">;
+    subtype: z.ZodString;
+    is_error: z.ZodOptional<z.ZodBoolean>;
+    duration_ms: z.ZodOptional<z.ZodNumber>;
+    duration_api_ms: z.ZodOptional<z.ZodNumber>;
+    num_turns: z.ZodOptional<z.ZodNumber>;
+    result: z.ZodOptional<z.ZodString>;
+    stop_reason: z.ZodOptional<z.ZodNullable<z.ZodString>>;
+    total_cost_usd: z.ZodOptional<z.ZodNumber>;
+    usage: z.ZodOptional<z.ZodObject<{}, "passthrough", z.ZodTypeAny, z.objectOutputType<{}, z.ZodTypeAny, "passthrough">, z.objectInputType<{}, z.ZodTypeAny, "passthrough">>>;
+    modelUsage: z.ZodOptional<z.ZodRecord<z.ZodString, z.ZodAny>>;
+    permission_denials: z.ZodOptional<z.ZodArray<z.ZodObject<{}, "passthrough", z.ZodTypeAny, z.objectOutputType<{}, z.ZodTypeAny, "passthrough">, z.objectInputType<{}, z.ZodTypeAny, "passthrough">>, "many">>;
+    structured_output: z.ZodOptional<z.ZodUnknown>;
+    errors: z.ZodOptional<z.ZodArray<z.ZodString, "many">>;
+}, z.ZodTypeAny, "passthrough">, z.objectInputType<{
+    uuid: z.ZodOptional<z.ZodString>;
+    session_id: z.ZodOptional<z.ZodString>;
+} & {
+    type: z.ZodLiteral<"result">;
+    subtype: z.ZodString;
+    is_error: z.ZodOptional<z.ZodBoolean>;
+    duration_ms: z.ZodOptional<z.ZodNumber>;
+    duration_api_ms: z.ZodOptional<z.ZodNumber>;
+    num_turns: z.ZodOptional<z.ZodNumber>;
+    result: z.ZodOptional<z.ZodString>;
+    stop_reason: z.ZodOptional<z.ZodNullable<z.ZodString>>;
+    total_cost_usd: z.ZodOptional<z.ZodNumber>;
+    usage: z.ZodOptional<z.ZodObject<{}, "passthrough", z.ZodTypeAny, z.objectOutputType<{}, z.ZodTypeAny, "passthrough">, z.objectInputType<{}, z.ZodTypeAny, "passthrough">>>;
+    modelUsage: z.ZodOptional<z.ZodRecord<z.ZodString, z.ZodAny>>;
+    permission_denials: z.ZodOptional<z.ZodArray<z.ZodObject<{}, "passthrough", z.ZodTypeAny, z.objectOutputType<{}, z.ZodTypeAny, "passthrough">, z.objectInputType<{}, z.ZodTypeAny, "passthrough">>, "many">>;
+    structured_output: z.ZodOptional<z.ZodUnknown>;
+    errors: z.ZodOptional<z.ZodArray<z.ZodString, "many">>;
+}, z.ZodTypeAny, "passthrough">>;
+type ResultLine = z.infer<typeof ResultLineSchema>;
+/** Control request from CLI → wrapper. Dispatched to the control router. */
+declare const ControlRequestLineSchema: z.ZodObject<{
+    type: z.ZodLiteral<"control_request">;
+    request_id: z.ZodString;
+    request: z.ZodObject<{
+        subtype: z.ZodString;
+    }, "passthrough", z.ZodTypeAny, z.objectOutputType<{
+        subtype: z.ZodString;
+    }, z.ZodTypeAny, "passthrough">, z.objectInputType<{
+        subtype: z.ZodString;
+    }, z.ZodTypeAny, "passthrough">>;
+}, "passthrough", z.ZodTypeAny, z.objectOutputType<{
+    type: z.ZodLiteral<"control_request">;
+    request_id: z.ZodString;
+    request: z.ZodObject<{
+        subtype: z.ZodString;
+    }, "passthrough", z.ZodTypeAny, z.objectOutputType<{
+        subtype: z.ZodString;
+    }, z.ZodTypeAny, "passthrough">, z.objectInputType<{
+        subtype: z.ZodString;
+    }, z.ZodTypeAny, "passthrough">>;
+}, z.ZodTypeAny, "passthrough">, z.objectInputType<{
+    type: z.ZodLiteral<"control_request">;
+    request_id: z.ZodString;
+    request: z.ZodObject<{
+        subtype: z.ZodString;
+    }, "passthrough", z.ZodTypeAny, z.objectOutputType<{
+        subtype: z.ZodString;
+    }, z.ZodTypeAny, "passthrough">, z.objectInputType<{
+        subtype: z.ZodString;
+    }, z.ZodTypeAny, "passthrough">>;
+}, z.ZodTypeAny, "passthrough">>;
+type ControlRequestLine = z.infer<typeof ControlRequestLineSchema>;
+/** Control response — normally wrapper → CLI, but can echo on stdout too. */
+declare const ControlResponseLineSchema: z.ZodObject<{
+    type: z.ZodLiteral<"control_response">;
+    response: z.ZodObject<{
+        subtype: z.ZodEnum<["success", "error"]>;
+        request_id: z.ZodString;
+    }, "passthrough", z.ZodTypeAny, z.objectOutputType<{
+        subtype: z.ZodEnum<["success", "error"]>;
+        request_id: z.ZodString;
+    }, z.ZodTypeAny, "passthrough">, z.objectInputType<{
+        subtype: z.ZodEnum<["success", "error"]>;
+        request_id: z.ZodString;
+    }, z.ZodTypeAny, "passthrough">>;
+}, "passthrough", z.ZodTypeAny, z.objectOutputType<{
+    type: z.ZodLiteral<"control_response">;
+    response: z.ZodObject<{
+        subtype: z.ZodEnum<["success", "error"]>;
+        request_id: z.ZodString;
+    }, "passthrough", z.ZodTypeAny, z.objectOutputType<{
+        subtype: z.ZodEnum<["success", "error"]>;
+        request_id: z.ZodString;
+    }, z.ZodTypeAny, "passthrough">, z.objectInputType<{
+        subtype: z.ZodEnum<["success", "error"]>;
+        request_id: z.ZodString;
+    }, z.ZodTypeAny, "passthrough">>;
+}, z.ZodTypeAny, "passthrough">, z.objectInputType<{
+    type: z.ZodLiteral<"control_response">;
+    response: z.ZodObject<{
+        subtype: z.ZodEnum<["success", "error"]>;
+        request_id: z.ZodString;
+    }, "passthrough", z.ZodTypeAny, z.objectOutputType<{
+        subtype: z.ZodEnum<["success", "error"]>;
+        request_id: z.ZodString;
+    }, z.ZodTypeAny, "passthrough">, z.objectInputType<{
+        subtype: z.ZodEnum<["success", "error"]>;
+        request_id: z.ZodString;
+    }, z.ZodTypeAny, "passthrough">>;
+}, z.ZodTypeAny, "passthrough">>;
+type ControlResponseLine = z.infer<typeof ControlResponseLineSchema>;
+/** `control_cancel_request` — CLI withdraws a pending control request. */
+declare const ControlCancelLineSchema: z.ZodObject<{
+    type: z.ZodLiteral<"control_cancel_request">;
+    request_id: z.ZodString;
+}, "passthrough", z.ZodTypeAny, z.objectOutputType<{
+    type: z.ZodLiteral<"control_cancel_request">;
+    request_id: z.ZodString;
+}, z.ZodTypeAny, "passthrough">, z.objectInputType<{
+    type: z.ZodLiteral<"control_cancel_request">;
+    request_id: z.ZodString;
+}, z.ZodTypeAny, "passthrough">>;
+type ControlCancelLine = z.infer<typeof ControlCancelLineSchema>;
+/** `keep_alive` — NDJSON heartbeat, silently ignored by readers. */
+declare const KeepAliveLineSchema: z.ZodObject<{
+    type: z.ZodLiteral<"keep_alive">;
+}, "strip", z.ZodTypeAny, {
+    type: "keep_alive";
+}, {
+    type: "keep_alive";
+}>;
+type KeepAliveLine = z.infer<typeof KeepAliveLineSchema>;
+/** Fallthrough catch-all: the CLI adds new top-level types regularly. */
+declare const UnknownLineSchema: z.ZodObject<{
+    type: z.ZodString;
+}, "passthrough", z.ZodTypeAny, z.objectOutputType<{
+    type: z.ZodString;
+}, z.ZodTypeAny, "passthrough">, z.objectInputType<{
+    type: z.ZodString;
+}, z.ZodTypeAny, "passthrough">>;
+type UnknownLine = z.infer<typeof UnknownLineSchema>;
+/**
+ * Every line type we explicitly recognise. Each variant has a literal
+ * `type` discriminator so a `switch(line.type)` narrows exhaustively
+ * without casts. Used internally by `pump()` in `query.ts`.
+ */
+/** Emitted by the pump when a JSON line fails to parse. */
+interface ParseErrorLine {
+    type: '__parse_error';
+    raw: string;
+    error: string;
+}
+type KnownStreamLine = UserStreamLine | AssistantStreamLine | StreamEventLine | ToolProgressLine | SystemLine | RateLimitLine | ToolUseSummaryLine | ResultLine | ControlRequestLine | ControlResponseLine | ControlCancelLine | KeepAliveLine | ParseErrorLine;
+/**
+ * Public stream-line type. Callers iterate these out of `query().events`.
+ * Includes `UnknownLine` as a catch-all so the CLI can add new top-level
+ * types without breaking the wrapper.
+ */
+type StreamLine = KnownStreamLine | UnknownLine;
+/** `control_request` subtype=`can_use_tool` — the permission prompt. */
+interface CanUseToolRequest {
+    subtype: 'can_use_tool';
+    tool_name: string;
+    input: Record<string, unknown>;
+    tool_use_id: string;
+    agent_id?: string;
+    blocked_path?: string;
+    decision_reason?: string;
+    title?: string;
+    description?: string;
+}
+/**
+ * The response shape for `can_use_tool`, as required by the Claude Code
+ * CLI at:
+ *   packages/claude-code/src/utils/permissions/PermissionPromptToolResultSchema.ts
+ *
+ * - `allow` MUST include `updatedInput` (Record<string, unknown>). The CLI
+ *   treats an empty object as "run with the original tool input", so
+ *   callers that don't intend to modify the input should echo `req.input`
+ *   back verbatim — this is the safer default.
+ * - `deny` MUST include a `message` string. Callers that don't have a
+ *   specific reason should send a generic "User denied".
+ *
+ * Malformed responses (missing required fields) are rejected by the CLI
+ * with a `ZodError: invalid_union` that surfaces as "Tool permission
+ * request failed: …" on the user's tool-activity row. Both required
+ * fields are enforced statically here so that class of bug can't
+ * silently reoccur at the call site.
+ */
+type PermissionDecision = {
+    behavior: 'allow';
+    updatedInput: Record<string, unknown>;
+    updatedPermissions?: Array<Record<string, unknown>>;
+    toolUseID?: string;
+    decisionClassification?: 'user_temporary' | 'user_permanent' | 'user_reject';
+} | {
+    behavior: 'deny';
+    message: string;
+    interrupt?: boolean;
+    toolUseID?: string;
+    decisionClassification?: 'user_temporary' | 'user_permanent' | 'user_reject';
+};
+/** Caller hook: decide a tool permission request. */
+type PermissionHandler = (request: CanUseToolRequest) => PermissionDecision | Promise<PermissionDecision>;
+/** Caller hook: handle arbitrary control request subtypes we don't special-case. */
+type ControlRequestHandler = (request: {
+    subtype: string;
+} & Record<string, unknown>) => unknown | Promise<unknown>;
+/**
+ * Every option supported by `claude --print`. Grouped by concern.
+ *
+ * These translate 1:1 to CLI flags via `argsFromOptions()` — if you add a
+ * field here, add the mapping there and a unit test covering it.
+ */
+interface QueryOptions {
+    prompt?: string | UserInputMessage;
+    cwd?: string;
+    env?: NodeJS.ProcessEnv;
+    signal?: AbortSignal;
+    cliPath?: string;
+    model?: string;
+    fallbackModel?: string;
+    effort?: Effort;
+    thinking?: Thinking;
+    maxThinkingTokens?: number;
+    maxTurns?: number;
+    maxBudgetUsd?: number;
+    betas?: string[];
+    agent?: string;
+    agents?: Record<string, {
+        description: string;
+        prompt: string;
+    }>;
+    permissionMode?: PermissionMode;
+    dangerouslySkipPermissions?: boolean;
+    allowedTools?: string[];
+    disallowedTools?: string[];
+    tools?: string[] | 'default';
+    systemPrompt?: string;
+    appendSystemPrompt?: string;
+    systemPromptFile?: string;
+    appendSystemPromptFile?: string;
+    mcpConfig?: string[];
+    strictMcpConfig?: boolean;
+    pluginDir?: string[];
+    addDir?: string[];
+    settings?: string;
+    settingSources?: SettingScope[];
+    jsonSchema?: unknown;
+    sessionId?: string;
+    continue?: boolean;
+    resume?: string | true;
+    forkSession?: boolean;
+    /** Load only messages up to this CLI message UUID (SDK/print mode). */
+    resumeSessionAt?: string;
+    /** Restore files to state at this user message UUID and exit. Requires resume. */
+    rewindFiles?: string;
+    noSessionPersistence?: boolean;
+    /** Run in a git worktree for isolated file mutations. Optional name. */
+    worktree?: string | true;
+    includePartialMessages?: boolean;
+    includeHookEvents?: boolean;
+    replayUserMessages?: boolean;
+    /**
+     * Keep stdin open after the initial `prompt` is written so the caller can
+     * drive follow-up turns via `handle.send()`. Default `false` — the CLI's
+     * stream-json mode blocks waiting for more stdin input after emitting the
+     * `result` line, so leaving stdin open deadlocks callers that just drain
+     * events in a `for await`. If you set this, you OWN `handle.close()`.
+     */
+    keepStdinOpen?: boolean;
+    /**
+     * Surface `control_request` events in the `handle.events` stream instead of
+     * routing them through the `onPermissionRequest` / `onControlRequest` callbacks.
+     * The consumer handles them inline in its event loop and sends responses via
+     * `handle.respond(requestId, response)`. Default `false` for backwards compat.
+     *
+     * When `true`, the callbacks are ignored — the pump pushes control_request
+     * lines into the event queue like any other event type, and the consumer is
+     * responsible for sending the control_response.
+     */
+    surfaceControlRequests?: boolean;
+    onPermissionRequest?: PermissionHandler;
+    onControlRequest?: ControlRequestHandler;
+}
+/** User message written to stdin during a stream-json conversation. */
+interface UserInputMessage {
+    type: 'user';
+    message: {
+        role: 'user';
+        content: string | Array<Record<string, unknown>>;
+    };
+    parent_tool_use_id?: string | null;
+    session_id?: string;
+}
+/** Normalised result returned from `query().result`. */
+interface QueryResult {
+    sessionId: string;
+    text: string;
+    durationMs: number;
+    numTurns: number;
+    totalCostUsd: number;
+    usage?: Record<string, unknown>;
+    structuredOutput?: unknown;
+    permissionDenials: Array<Record<string, unknown>>;
+    raw: ResultLine;
+}
+
+type BlockType = 'prompt' | 'note' | 'markdown' | 'file-picker' | 'choice' | 'text' | 'approval' | 'actions' | 'link' | 'button-group' | 'tool-activity' | 'question' | 'project-select' | 'toggles' | 'tool-input' | 'context-usage' | 'session-list';
 interface BlockConfig {
     type: BlockType;
     props: Record<string, any>;
@@ -377,7 +1037,7 @@ interface ImageReference {
     url: string;
     name: string;
 }
-type ContextReferenceType = 'thread' | 'document' | 'note';
+type ContextReferenceType = 'thread' | 'document' | 'note' | 'task' | 'tasklist' | 'folder';
 interface ContextReference {
     refType: ContextReferenceType;
     refId: string;
@@ -389,18 +1049,101 @@ interface MessageReferences {
     files?: FileReference[];
     context?: ContextReference[];
 }
+/**
+ * Shapes a block can emit back to the backend when the user interacts
+ * with it. Non-discriminated on purpose — text and choice blocks emit
+ * raw primitives on submit (TextInput.vue:207, ChoiceInput.vue:225),
+ * while approval and cancel blocks emit tagged objects
+ * (InteractionContainer.vue:156-167). Wrapping the primitives into
+ * `{ type: 'text', value: string }` etc. would be a wire-shape break,
+ * so we encode the reality instead: a union of every observed shape
+ * with no synthetic discriminator.
+ *
+ * Consumers MUST narrow before using the value. The canonical parse
+ * helpers are the authoritative places to do that:
+ *
+ *   - `parseApprovalDecision` at
+ *       packages/default-setup/src/actions/claude-code/_helpers/approval-response.ts
+ *     — narrows to `{ allow, reason? }` for approval blocks
+ *
+ *   - `parseStepResponse` at
+ *       packages/default-setup/src/actions/onboarding/_helpers/parse-step-response.ts
+ *     — narrows per onboarding step with a `cancelled` flag
+ *
+ * When adding a new block type, extend this union first, then add a
+ * matching parser in `_helpers/` and a unit test that pins the new
+ * shape (see claude-code-approval-response.spec.ts and
+ * onboarding-step-response.spec.ts for the pattern).
+ *
+ * Legacy data: messages persisted before this type was introduced may
+ * carry the stale `{ value: 'yes' }` shape, but no frontend has ever
+ * emitted it — the `?? response` fallback in the old handler was dead
+ * code. Still, `blockResponse?: unknown` at the storage boundary is
+ * more defensive than assuming the union is exhaustive; however the
+ * EVENT-level and FIELD-level types use the union because every
+ * non-legacy emit matches one of its arms.
+ */
+type BlockResponse = 
+/** Approval buttons: InteractionContainer `handleApprove`/`handleDeny`. */
+{
+    approved: boolean;
+    reason?: string;
+}
+/** Cancel path: InteractionContainer `handleCancel`. */
+ | {
+    cancelled: true;
+}
+/** Text input (single or multiline) and single-select choice emit a raw string. */
+ | string
+/** Multi-select choice emits a raw string array (of choice ids). */
+ | string[];
 interface MessageEntity extends BaseEntity {
     entityType: EARS.Entity.Message;
     text: string;
-    sender: 'user' | 'assistant' | 'system';
+    sender: 'user' | 'assistant' | 'system' | 'marker';
     timestamp: number;
     responseTimestamp?: number;
     blocks?: BlockConfig[];
-    blockResponse?: any;
+    /**
+     * Response data for block-based interactions. See the `BlockResponse`
+     * union above for the full set of observed shapes. Always narrow
+     * before use via a parse helper — the raw field is stored as the
+     * exact value the frontend emitted, which may be a primitive
+     * (string / string[]) or a tagged object.
+     */
+    blockResponse?: BlockResponse;
     forkable?: boolean;
     references?: MessageReferences;
     isCommand?: boolean;
     command?: string;
+    /** Ephemeral UI state (e.g. 'queued' while waiting behind an active turn). */
+    status?: 'queued' | 'cancelled' | null;
+    /** Free-form per-message metadata. Feature-namespaced (e.g. `{ cliUuid: '...' }`). */
+    context?: Record<string, unknown>;
+    /** When true, collapse to a compact aside after the user responds. */
+    autoHide?: boolean;
+    /** When true, the collapsed aside aligns to the user (right) side. */
+    asUser?: boolean;
+    /** Backend-computed summary text shown when collapsed (e.g. "✓ Approved"). */
+    asideText?: string;
+    /** Caller-supplied context label for the collapsed aside (overrides auto-derived context). */
+    asideContext?: string;
+    /** When true, message is hidden because a marker message compacted it. */
+    compacted?: boolean;
+}
+/**
+ * Free-form per-thread scratchpad for features that need to persist small
+ * amounts of state alongside a thread. Keys are namespaced by feature name
+ * (e.g. `claudeCode`) so multiple features don't collide. Anything goes
+ * under a feature key — this is intentionally untyped at the container
+ * level so new contributors don't need to edit this file.
+ */
+interface ThreadContext {
+    claudeCode?: {
+        sessionId?: string;
+        lastTurnAt?: number;
+    };
+    [featureKey: string]: unknown;
 }
 interface ThreadEntity extends BaseEntity {
     entityType: EARS.Entity.Thread;
@@ -415,12 +1158,15 @@ interface ThreadEntity extends BaseEntity {
     tags?: string[];
     forcedMode?: 'birth';
     pinned?: boolean;
+    archived?: boolean;
+    chatState?: string;
+    context?: ThreadContext;
 }
 interface ArtifactEntity extends BaseEntity {
     entityType: EARS.Entity.Artifact;
     title?: string;
     content: string | any;
-    artifactType: 'text' | 'code' | 'image' | 'json' | 'graph' | 'table' | 'slack';
+    artifactType: ArtifactType;
 }
 declare const ThreadRelations: readonly ["parent_of", "blocks", "blocked_by", "duplicates"];
 type ThreadLinkRelation = typeof ThreadRelations[number];
@@ -431,6 +1177,8 @@ type ThreadEditFields = Simplify<Pick<ThreadEntity, 'topic' | 'instructions'> & 
     status?: ThreadEntity['status'];
 } & {
     tags?: string[];
+} & {
+    context?: ThreadContext;
 } & ThreadLinkedFields>;
 type ThreadLinkedFields = {
     linkedThreads?: ThreadLinkItem[];
@@ -440,7 +1188,9 @@ type ThreadCreateData = Simplify<ThreadEditFields & {
     forcedMode?: 'birth';
     pinned?: boolean;
 }>;
-type ThreadExtended = Simplify<ThreadEntity & ThreadExtendedData>;
+type ThreadExtended = Simplify<ThreadEntity & ThreadExtendedData & {
+    parentId?: string;
+}>;
 type ThreadExtendedData = ThreadLinkedFields & {
     messages?: Partial<MessageEntity>[];
     tags?: string[];
@@ -449,8 +1199,8 @@ type ThreadConnectedData = {
     threads: ThreadExtended[];
     availableTags: ThreadTagOption[];
     settings?: ThreadsSettings | null;
+    chatStates?: Record<string, string>;
 };
-
 type AgentThreadData = {
     id?: ThreadEntity['id'];
     shortCode?: ThreadEntity['shortCode'];
@@ -462,6 +1212,7 @@ type AgentThreadData = {
     artifacts: ArtifactEntity[];
     forcedMode?: ThreadEntity['forcedMode'];
     pinned?: boolean;
+    chatState?: string;
 };
 type RecentThreadRefreshData = {
     recentThreads: Partial<ThreadEntity>[];
@@ -470,6 +1221,7 @@ interface AgentPhase {
     id: string;
     name: string;
     description: string;
+    color?: string;
 }
 interface AgentMode {
     id: string;
@@ -495,11 +1247,15 @@ interface AgentSettings {
         [key: string]: KeyboardShortcut | null | undefined;
     };
     quickPrompts?: QuickPrompt[];
+    quickPromptNumberKeyInserts?: boolean;
     skipRevertConfirm?: boolean;
+    defaultMode?: string;
+    defaultPhase?: string;
 }
 type AgentConnectedData = {
     currentThread: AgentThreadData | null;
     threads: Partial<ThreadEntity>[];
+    recentThreads: Partial<ThreadEntity>[];
     tabs: Tab[];
     settings?: AgentSettings;
     hasRequiredApiKeys: boolean;
@@ -512,7 +1268,7 @@ interface Tab {
     selectedArtifactId?: string;
     pinned?: boolean;
 }
-type ArtifactType = 'text' | 'code' | 'review' | 'image' | 'slack' | 'todo' | 'project' | 'json';
+type ArtifactType = 'text' | 'code' | 'review' | 'image' | 'slack' | 'todo' | 'project' | 'json' | 'graph' | 'table' | 'markdown' | 'claude-session' | 'diff' | 'plan' | 'note';
 interface ArtifactItem {
     id: string;
     type: ArtifactType;
@@ -524,98 +1280,6 @@ interface ArtifactItem {
         [key: string]: any;
     };
 }
-
-interface FileInfo {
-    name: string;
-    path: string;
-    type: 'file' | 'directory';
-    size?: number;
-    modifiedAt?: Date;
-    extension?: string;
-}
-interface DirectoryContent {
-    path: string;
-    files: FileInfo[];
-}
-interface FileContent {
-    path: string;
-    content: string;
-    encoding: string;
-}
-interface CodeSystemError {
-    code: 'NOT_FOUND' | 'PERMISSION_DENIED' | 'INVALID_PATH' | 'IO_ERROR' | 'FILE_TOO_LARGE' | 'SEARCH_ERROR';
-    message: string;
-    path?: string;
-}
-interface SearchMatch {
-    line: number;
-    column: number;
-    lineText: string;
-    matchStart: number;
-    matchEnd: number;
-}
-interface SearchResult {
-    path: string;
-    matches: SearchMatch[];
-    fileSize?: number;
-}
-interface SearchProgress {
-    filesSearched: number;
-    totalFiles: number;
-    currentFile?: string;
-}
-interface GitStatusFile {
-    path: string;
-    status: 'modified' | 'added' | 'deleted' | 'renamed' | 'untracked' | 'copied' | 'typechange' | 'unmerged';
-    staged: boolean;
-    originalPath?: string;
-    score?: number;
-}
-interface GitDiff {
-    path: string;
-    diff: string;
-    staged: boolean;
-    originalContent?: string;
-    modifiedContent?: string;
-}
-interface TerminalInfo {
-    id: EARS.EntityId;
-    title: string;
-    customTitle?: string;
-    pid: number;
-    shell?: string;
-    cwd: string;
-    active: boolean;
-    cols: number;
-    rows: number;
-}
-interface QuickOpenResult {
-    path: string;
-    relativePath: string;
-    name: string;
-    type: 'file' | 'directory';
-    extension?: string;
-    score?: number;
-}
-interface CodeSettings {
-    hotkeys: {
-        openTerminal?: KeyboardShortcut | null;
-        navigatePrevPanel?: KeyboardShortcut | null;
-        navigateNextPanel?: KeyboardShortcut | null;
-        focusSearch?: KeyboardShortcut | null;
-        [key: string]: KeyboardShortcut | null | undefined;
-    };
-    restoreTerminals?: boolean;
-    defaultBaseDirectory?: string | null;
-    lastDirectoryOpened?: string | null;
-    enableShellIntegration?: boolean;
-    confirmTerminalClose?: boolean;
-    closeTerminalOnTabClose?: boolean;
-}
-type CodeConnectedData = {
-    baseDirectory: string | null;
-    settings?: CodeSettings;
-};
 
 type DocumentShortCode = `DOC-${number}`;
 interface FieldContent {
@@ -666,6 +1330,7 @@ interface CollectionDTO {
     displayOrder: number;
     createdAt: string;
     updatedAt: string;
+    symlinkPath?: string;
 }
 interface FolderItem {
     type: 'folder';
@@ -681,6 +1346,7 @@ interface FolderItem {
     isSymlink?: boolean;
     symlinkPath?: string;
     isSymlinked?: boolean;
+    isBroken?: boolean;
 }
 interface DocumentItem {
     type: 'document';
@@ -705,6 +1371,8 @@ interface FolderContents {
     currentFolderId: EARS.EntityId | null;
     breadcrumbs: BreadcrumbItem[];
     searchIndices?: any[];
+    isBroken?: boolean;
+    lastKnownPath?: string;
 }
 interface BreadcrumbItem {
     id: EARS.EntityId | null;
@@ -818,15 +1486,6 @@ declare const events: {
         type: "RESET_SETTINGS";
         systemId: "settings";
     }>, zod.ZodObject<{
-        type: zod.ZodLiteral<"COMPLETE_ONBOARDING">;
-        systemId: zod.ZodLiteral<"settings">;
-    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
-        type: "COMPLETE_ONBOARDING";
-        systemId: "settings";
-    }, {
-        type: "COMPLETE_ONBOARDING";
-        systemId: "settings";
-    }>, zod.ZodObject<{
         type: zod.ZodLiteral<"SECRETS.CMD.CREATE_API_KEY">;
         systemId: zod.ZodLiteral<"settings">;
         provider: zod.ZodString;
@@ -893,407 +1552,82 @@ declare const events: {
         systemId: "settings";
         provider: string;
     }>, zod.ZodObject<{
-        type: zod.ZodLiteral<"IMPORT_SETUP_PACK">;
+        type: zod.ZodLiteral<"PREVIEW_SETUP_PACK">;
         systemId: zod.ZodLiteral<"settings">;
         directory: zod.ZodString;
     }, zod.UnknownKeysParam, zod.ZodTypeAny, {
-        type: "IMPORT_SETUP_PACK";
+        type: "PREVIEW_SETUP_PACK";
         systemId: "settings";
         directory: string;
     }, {
+        type: "PREVIEW_SETUP_PACK";
+        systemId: "settings";
+        directory: string;
+    }>, zod.ZodObject<{
+        type: zod.ZodLiteral<"IMPORT_SETUP_PACK">;
+        systemId: zod.ZodLiteral<"settings">;
+        directory: zod.ZodString;
+        include: zod.ZodOptional<zod.ZodObject<{
+            actions: zod.ZodNullable<zod.ZodArray<zod.ZodString, "many">>;
+            prompts: zod.ZodNullable<zod.ZodArray<zod.ZodString, "many">>;
+            flows: zod.ZodNullable<zod.ZodArray<zod.ZodString, "many">>;
+            library: zod.ZodNullable<zod.ZodArray<zod.ZodString, "many">>;
+            notes: zod.ZodNullable<zod.ZodArray<zod.ZodString, "many">>;
+            settings: zod.ZodNullable<zod.ZodArray<zod.ZodString, "many">>;
+        }, "strip", zod.ZodTypeAny, {
+            settings: string[] | null;
+            actions: string[] | null;
+            prompts: string[] | null;
+            flows: string[] | null;
+            library: string[] | null;
+            notes: string[] | null;
+        }, {
+            settings: string[] | null;
+            actions: string[] | null;
+            prompts: string[] | null;
+            flows: string[] | null;
+            library: string[] | null;
+            notes: string[] | null;
+        }>>;
+        mode: zod.ZodOptional<zod.ZodEnum<["keep-existing", "replace-on-collision", "wipe-and-replace"]>>;
+        restartBrain: zod.ZodOptional<zod.ZodBoolean>;
+    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
         type: "IMPORT_SETUP_PACK";
         systemId: "settings";
         directory: string;
-    }>] | readonly [zod.ZodObject<{
-        type: zod.ZodLiteral<"USER_MSG">;
-        systemId: zod.ZodLiteral<"agent">;
-        text: zod.ZodString;
-        mode: zod.ZodOptional<zod.ZodString>;
-        phase: zod.ZodOptional<zod.ZodString>;
-        threadId: zod.ZodOptional<zod.ZodString>;
-        references: zod.ZodOptional<zod.ZodObject<{
-            images: zod.ZodOptional<zod.ZodArray<zod.ZodObject<{
-                url: zod.ZodString;
-                name: zod.ZodString;
-            }, "strip", zod.ZodTypeAny, {
-                url: string;
-                name: string;
-            }, {
-                url: string;
-                name: string;
-            }>, "many">>;
-            files: zod.ZodOptional<zod.ZodArray<zod.ZodObject<{
-                name: zod.ZodString;
-                path: zod.ZodString;
-                typeLabel: zod.ZodString;
-                isImage: zod.ZodBoolean;
-            }, "strip", zod.ZodTypeAny, {
-                path: string;
-                name: string;
-                typeLabel: string;
-                isImage: boolean;
-            }, {
-                path: string;
-                name: string;
-                typeLabel: string;
-                isImage: boolean;
-            }>, "many">>;
-            context: zod.ZodOptional<zod.ZodArray<zod.ZodObject<{
-                refType: zod.ZodEnum<["thread", "document", "note"]>;
-                refId: zod.ZodString;
-                shortCode: zod.ZodString;
-                label: zod.ZodString;
-            }, "strip", zod.ZodTypeAny, {
-                label: string;
-                shortCode: string;
-                refType: "document" | "thread" | "note";
-                refId: string;
-            }, {
-                label: string;
-                shortCode: string;
-                refType: "document" | "thread" | "note";
-                refId: string;
-            }>, "many">>;
-        }, "strip", zod.ZodTypeAny, {
-            images?: {
-                url: string;
-                name: string;
-            }[] | undefined;
-            files?: {
-                path: string;
-                name: string;
-                typeLabel: string;
-                isImage: boolean;
-            }[] | undefined;
-            context?: {
-                label: string;
-                shortCode: string;
-                refType: "document" | "thread" | "note";
-                refId: string;
-            }[] | undefined;
-        }, {
-            images?: {
-                url: string;
-                name: string;
-            }[] | undefined;
-            files?: {
-                path: string;
-                name: string;
-                typeLabel: string;
-                isImage: boolean;
-            }[] | undefined;
-            context?: {
-                label: string;
-                shortCode: string;
-                refType: "document" | "thread" | "note";
-                refId: string;
-            }[] | undefined;
-        }>>;
-    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
-        text: string;
-        type: "USER_MSG";
-        systemId: "agent";
-        references?: {
-            images?: {
-                url: string;
-                name: string;
-            }[] | undefined;
-            files?: {
-                path: string;
-                name: string;
-                typeLabel: string;
-                isImage: boolean;
-            }[] | undefined;
-            context?: {
-                label: string;
-                shortCode: string;
-                refType: "document" | "thread" | "note";
-                refId: string;
-            }[] | undefined;
+        include?: {
+            settings: string[] | null;
+            actions: string[] | null;
+            prompts: string[] | null;
+            flows: string[] | null;
+            library: string[] | null;
+            notes: string[] | null;
         } | undefined;
-        mode?: string | undefined;
-        phase?: string | undefined;
-        threadId?: string | undefined;
+        mode?: "keep-existing" | "replace-on-collision" | "wipe-and-replace" | undefined;
+        restartBrain?: boolean | undefined;
     }, {
-        text: string;
-        type: "USER_MSG";
-        systemId: "agent";
-        references?: {
-            images?: {
-                url: string;
-                name: string;
-            }[] | undefined;
-            files?: {
-                path: string;
-                name: string;
-                typeLabel: string;
-                isImage: boolean;
-            }[] | undefined;
-            context?: {
-                label: string;
-                shortCode: string;
-                refType: "document" | "thread" | "note";
-                refId: string;
-            }[] | undefined;
+        type: "IMPORT_SETUP_PACK";
+        systemId: "settings";
+        directory: string;
+        include?: {
+            settings: string[] | null;
+            actions: string[] | null;
+            prompts: string[] | null;
+            flows: string[] | null;
+            library: string[] | null;
+            notes: string[] | null;
         } | undefined;
-        mode?: string | undefined;
-        phase?: string | undefined;
-        threadId?: string | undefined;
+        mode?: "keep-existing" | "replace-on-collision" | "wipe-and-replace" | undefined;
+        restartBrain?: boolean | undefined;
     }>, zod.ZodObject<{
-        type: zod.ZodLiteral<"OPEN_THREAD_CHAT">;
-        systemId: zod.ZodLiteral<"agent">;
-        threadId: zod.ZodString;
+        type: zod.ZodLiteral<"RESET_APP">;
+        systemId: zod.ZodLiteral<"settings">;
     }, zod.UnknownKeysParam, zod.ZodTypeAny, {
-        type: "OPEN_THREAD_CHAT";
-        systemId: "agent";
-        threadId: string;
+        type: "RESET_APP";
+        systemId: "settings";
     }, {
-        type: "OPEN_THREAD_CHAT";
-        systemId: "agent";
-        threadId: string;
-    }>, zod.ZodObject<{
-        type: zod.ZodLiteral<"OPEN_THREAD_TAB">;
-        systemId: zod.ZodLiteral<"agent">;
-        threadId: zod.ZodString;
-        label: zod.ZodString;
-        pinned: zod.ZodOptional<zod.ZodBoolean>;
-    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
-        label: string;
-        type: "OPEN_THREAD_TAB";
-        systemId: "agent";
-        threadId: string;
-        pinned?: boolean | undefined;
-    }, {
-        label: string;
-        type: "OPEN_THREAD_TAB";
-        systemId: "agent";
-        threadId: string;
-        pinned?: boolean | undefined;
-    }>, zod.ZodObject<{
-        type: zod.ZodLiteral<"CANCEL">;
-        systemId: zod.ZodLiteral<"agent">;
-    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
-        type: "CANCEL";
-        systemId: "agent";
-    }, {
-        type: "CANCEL";
-        systemId: "agent";
-    }>, zod.ZodObject<{
-        type: zod.ZodLiteral<"APPROVE_TODO_LIST">;
-        systemId: zod.ZodLiteral<"agent">;
-        artifactId: zod.ZodString;
-        tasks: zod.ZodArray<zod.ZodAny, "many">;
-    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
-        type: "APPROVE_TODO_LIST";
-        systemId: "agent";
-        artifactId: string;
-        tasks: any[];
-    }, {
-        type: "APPROVE_TODO_LIST";
-        systemId: "agent";
-        artifactId: string;
-        tasks: any[];
-    }>, zod.ZodObject<{
-        type: zod.ZodLiteral<"REJECT_TODO_LIST">;
-        systemId: zod.ZodLiteral<"agent">;
-        artifactId: zod.ZodString;
-    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
-        type: "REJECT_TODO_LIST";
-        systemId: "agent";
-        artifactId: string;
-    }, {
-        type: "REJECT_TODO_LIST";
-        systemId: "agent";
-        artifactId: string;
-    }>, zod.ZodObject<{
-        type: zod.ZodLiteral<"INTERACTIVE_MSG_RESPONSE">;
-        systemId: zod.ZodLiteral<"agent">;
-        messageId: zod.ZodString;
-        threadId: zod.ZodString;
-        response: zod.ZodAny;
-    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
-        type: "INTERACTIVE_MSG_RESPONSE";
-        systemId: "agent";
-        threadId: string;
-        messageId: string;
-        response?: any;
-    }, {
-        type: "INTERACTIVE_MSG_RESPONSE";
-        systemId: "agent";
-        threadId: string;
-        messageId: string;
-        response?: any;
-    }>, zod.ZodObject<{
-        type: zod.ZodLiteral<"FORK_THREAD">;
-        systemId: zod.ZodLiteral<"agent">;
-        messageId: zod.ZodString;
-        threadId: zod.ZodOptional<zod.ZodString>;
-        threadTopic: zod.ZodOptional<zod.ZodString>;
-    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
-        type: "FORK_THREAD";
-        systemId: "agent";
-        messageId: string;
-        threadId?: string | undefined;
-        threadTopic?: string | undefined;
-    }, {
-        type: "FORK_THREAD";
-        systemId: "agent";
-        messageId: string;
-        threadId?: string | undefined;
-        threadTopic?: string | undefined;
-    }>, zod.ZodObject<{
-        type: zod.ZodLiteral<"REVERT_THREAD">;
-        systemId: zod.ZodLiteral<"agent">;
-        messageId: zod.ZodString;
-        threadId: zod.ZodString;
-    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
-        type: "REVERT_THREAD";
-        systemId: "agent";
-        threadId: string;
-        messageId: string;
-    }, {
-        type: "REVERT_THREAD";
-        systemId: "agent";
-        threadId: string;
-        messageId: string;
-    }>, zod.ZodObject<{
-        type: zod.ZodLiteral<"USER_COMMAND">;
-        systemId: zod.ZodLiteral<"agent">;
-        command: zod.ZodString;
-        text: zod.ZodString;
-        mode: zod.ZodOptional<zod.ZodString>;
-        phase: zod.ZodOptional<zod.ZodString>;
-        threadId: zod.ZodOptional<zod.ZodString>;
-        references: zod.ZodOptional<zod.ZodObject<{
-            images: zod.ZodOptional<zod.ZodArray<zod.ZodObject<{
-                url: zod.ZodString;
-                name: zod.ZodString;
-            }, "strip", zod.ZodTypeAny, {
-                url: string;
-                name: string;
-            }, {
-                url: string;
-                name: string;
-            }>, "many">>;
-            files: zod.ZodOptional<zod.ZodArray<zod.ZodObject<{
-                name: zod.ZodString;
-                path: zod.ZodString;
-                typeLabel: zod.ZodString;
-                isImage: zod.ZodBoolean;
-            }, "strip", zod.ZodTypeAny, {
-                path: string;
-                name: string;
-                typeLabel: string;
-                isImage: boolean;
-            }, {
-                path: string;
-                name: string;
-                typeLabel: string;
-                isImage: boolean;
-            }>, "many">>;
-            context: zod.ZodOptional<zod.ZodArray<zod.ZodObject<{
-                refType: zod.ZodEnum<["thread", "document", "note"]>;
-                refId: zod.ZodString;
-                shortCode: zod.ZodString;
-                label: zod.ZodString;
-            }, "strip", zod.ZodTypeAny, {
-                label: string;
-                shortCode: string;
-                refType: "document" | "thread" | "note";
-                refId: string;
-            }, {
-                label: string;
-                shortCode: string;
-                refType: "document" | "thread" | "note";
-                refId: string;
-            }>, "many">>;
-        }, "strip", zod.ZodTypeAny, {
-            images?: {
-                url: string;
-                name: string;
-            }[] | undefined;
-            files?: {
-                path: string;
-                name: string;
-                typeLabel: string;
-                isImage: boolean;
-            }[] | undefined;
-            context?: {
-                label: string;
-                shortCode: string;
-                refType: "document" | "thread" | "note";
-                refId: string;
-            }[] | undefined;
-        }, {
-            images?: {
-                url: string;
-                name: string;
-            }[] | undefined;
-            files?: {
-                path: string;
-                name: string;
-                typeLabel: string;
-                isImage: boolean;
-            }[] | undefined;
-            context?: {
-                label: string;
-                shortCode: string;
-                refType: "document" | "thread" | "note";
-                refId: string;
-            }[] | undefined;
-        }>>;
-    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
-        text: string;
-        command: string;
-        type: "USER_COMMAND";
-        systemId: "agent";
-        references?: {
-            images?: {
-                url: string;
-                name: string;
-            }[] | undefined;
-            files?: {
-                path: string;
-                name: string;
-                typeLabel: string;
-                isImage: boolean;
-            }[] | undefined;
-            context?: {
-                label: string;
-                shortCode: string;
-                refType: "document" | "thread" | "note";
-                refId: string;
-            }[] | undefined;
-        } | undefined;
-        mode?: string | undefined;
-        phase?: string | undefined;
-        threadId?: string | undefined;
-    }, {
-        text: string;
-        command: string;
-        type: "USER_COMMAND";
-        systemId: "agent";
-        references?: {
-            images?: {
-                url: string;
-                name: string;
-            }[] | undefined;
-            files?: {
-                path: string;
-                name: string;
-                typeLabel: string;
-                isImage: boolean;
-            }[] | undefined;
-            context?: {
-                label: string;
-                shortCode: string;
-                refType: "document" | "thread" | "note";
-                refId: string;
-            }[] | undefined;
-        } | undefined;
-        mode?: string | undefined;
-        phase?: string | undefined;
-        threadId?: string | undefined;
+        type: "RESET_APP";
+        systemId: "settings";
     }>] | readonly [zod.ZodObject<{
         type: zod.ZodLiteral<"OPEN_TNODE">;
         systemId: zod.ZodLiteral<"brain">;
@@ -1529,6 +1863,21 @@ declare const events: {
         systemId: "threads";
         threadId: string;
     }>, zod.ZodObject<{
+        type: zod.ZodLiteral<"SET_THREAD_PARENT">;
+        systemId: zod.ZodLiteral<"threads">;
+        childIds: zod.ZodArray<zod.ZodString, "many">;
+        parentId: zod.ZodString;
+    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
+        type: "SET_THREAD_PARENT";
+        systemId: "threads";
+        childIds: string[];
+        parentId: string;
+    }, {
+        type: "SET_THREAD_PARENT";
+        systemId: "threads";
+        childIds: string[];
+        parentId: string;
+    }>, zod.ZodObject<{
         type: zod.ZodLiteral<"EXPORT_THREADS">;
         systemId: zod.ZodLiteral<"threads">;
         directory: zod.ZodString;
@@ -1552,6 +1901,465 @@ declare const events: {
         type: "IMPORT_THREADS";
         systemId: "threads";
         directory: string;
+    }>, zod.ZodObject<{
+        type: zod.ZodLiteral<"USER_MSG">;
+        systemId: zod.ZodLiteral<"threads">;
+        text: zod.ZodString;
+        mode: zod.ZodOptional<zod.ZodString>;
+        phase: zod.ZodOptional<zod.ZodString>;
+        threadId: zod.ZodOptional<zod.ZodString>;
+        references: zod.ZodOptional<zod.ZodObject<{
+            images: zod.ZodOptional<zod.ZodArray<zod.ZodObject<{
+                url: zod.ZodString;
+                name: zod.ZodString;
+            }, "strip", zod.ZodTypeAny, {
+                url: string;
+                name: string;
+            }, {
+                url: string;
+                name: string;
+            }>, "many">>;
+            files: zod.ZodOptional<zod.ZodArray<zod.ZodObject<{
+                name: zod.ZodString;
+                path: zod.ZodString;
+                typeLabel: zod.ZodString;
+                isImage: zod.ZodBoolean;
+            }, "strip", zod.ZodTypeAny, {
+                path: string;
+                name: string;
+                typeLabel: string;
+                isImage: boolean;
+            }, {
+                path: string;
+                name: string;
+                typeLabel: string;
+                isImage: boolean;
+            }>, "many">>;
+            context: zod.ZodOptional<zod.ZodArray<zod.ZodObject<{
+                refType: zod.ZodEnum<["thread", "document", "note", "task", "tasklist", "folder"]>;
+                refId: zod.ZodString;
+                shortCode: zod.ZodString;
+                label: zod.ZodString;
+            }, "strip", zod.ZodTypeAny, {
+                label: string;
+                shortCode: string;
+                refType: "note" | "document" | "folder" | "tasklist" | "task" | "thread";
+                refId: string;
+            }, {
+                label: string;
+                shortCode: string;
+                refType: "note" | "document" | "folder" | "tasklist" | "task" | "thread";
+                refId: string;
+            }>, "many">>;
+        }, "strip", zod.ZodTypeAny, {
+            context?: {
+                label: string;
+                shortCode: string;
+                refType: "note" | "document" | "folder" | "tasklist" | "task" | "thread";
+                refId: string;
+            }[] | undefined;
+            images?: {
+                url: string;
+                name: string;
+            }[] | undefined;
+            files?: {
+                path: string;
+                name: string;
+                typeLabel: string;
+                isImage: boolean;
+            }[] | undefined;
+        }, {
+            context?: {
+                label: string;
+                shortCode: string;
+                refType: "note" | "document" | "folder" | "tasklist" | "task" | "thread";
+                refId: string;
+            }[] | undefined;
+            images?: {
+                url: string;
+                name: string;
+            }[] | undefined;
+            files?: {
+                path: string;
+                name: string;
+                typeLabel: string;
+                isImage: boolean;
+            }[] | undefined;
+        }>>;
+    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
+        text: string;
+        type: "USER_MSG";
+        systemId: "threads";
+        references?: {
+            context?: {
+                label: string;
+                shortCode: string;
+                refType: "note" | "document" | "folder" | "tasklist" | "task" | "thread";
+                refId: string;
+            }[] | undefined;
+            images?: {
+                url: string;
+                name: string;
+            }[] | undefined;
+            files?: {
+                path: string;
+                name: string;
+                typeLabel: string;
+                isImage: boolean;
+            }[] | undefined;
+        } | undefined;
+        mode?: string | undefined;
+        threadId?: string | undefined;
+        phase?: string | undefined;
+    }, {
+        text: string;
+        type: "USER_MSG";
+        systemId: "threads";
+        references?: {
+            context?: {
+                label: string;
+                shortCode: string;
+                refType: "note" | "document" | "folder" | "tasklist" | "task" | "thread";
+                refId: string;
+            }[] | undefined;
+            images?: {
+                url: string;
+                name: string;
+            }[] | undefined;
+            files?: {
+                path: string;
+                name: string;
+                typeLabel: string;
+                isImage: boolean;
+            }[] | undefined;
+        } | undefined;
+        mode?: string | undefined;
+        threadId?: string | undefined;
+        phase?: string | undefined;
+    }>, zod.ZodObject<{
+        type: zod.ZodLiteral<"OPEN_THREAD_CHAT">;
+        systemId: zod.ZodLiteral<"threads">;
+        threadId: zod.ZodString;
+    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
+        type: "OPEN_THREAD_CHAT";
+        systemId: "threads";
+        threadId: string;
+    }, {
+        type: "OPEN_THREAD_CHAT";
+        systemId: "threads";
+        threadId: string;
+    }>, zod.ZodObject<{
+        type: zod.ZodLiteral<"OPEN_THREAD_TAB">;
+        systemId: zod.ZodLiteral<"threads">;
+        threadId: zod.ZodString;
+        label: zod.ZodString;
+        pinned: zod.ZodOptional<zod.ZodBoolean>;
+    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
+        label: string;
+        type: "OPEN_THREAD_TAB";
+        systemId: "threads";
+        threadId: string;
+        pinned?: boolean | undefined;
+    }, {
+        label: string;
+        type: "OPEN_THREAD_TAB";
+        systemId: "threads";
+        threadId: string;
+        pinned?: boolean | undefined;
+    }>, zod.ZodObject<{
+        type: zod.ZodLiteral<"PAUSE_TURN">;
+        systemId: zod.ZodLiteral<"threads">;
+        threadId: zod.ZodString;
+    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
+        type: "PAUSE_TURN";
+        systemId: "threads";
+        threadId: string;
+    }, {
+        type: "PAUSE_TURN";
+        systemId: "threads";
+        threadId: string;
+    }>, zod.ZodObject<{
+        type: zod.ZodLiteral<"APPROVE_TODO_LIST">;
+        systemId: zod.ZodLiteral<"threads">;
+        artifactId: zod.ZodString;
+        tasks: zod.ZodArray<zod.ZodAny, "many">;
+    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
+        type: "APPROVE_TODO_LIST";
+        systemId: "threads";
+        artifactId: string;
+        tasks: any[];
+    }, {
+        type: "APPROVE_TODO_LIST";
+        systemId: "threads";
+        artifactId: string;
+        tasks: any[];
+    }>, zod.ZodObject<{
+        type: zod.ZodLiteral<"REJECT_TODO_LIST">;
+        systemId: zod.ZodLiteral<"threads">;
+        artifactId: zod.ZodString;
+    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
+        type: "REJECT_TODO_LIST";
+        systemId: "threads";
+        artifactId: string;
+    }, {
+        type: "REJECT_TODO_LIST";
+        systemId: "threads";
+        artifactId: string;
+    }>, zod.ZodObject<{
+        type: zod.ZodLiteral<"INTERACTIVE_MSG_RESPONSE">;
+        systemId: zod.ZodLiteral<"threads">;
+        messageId: zod.ZodString;
+        threadId: zod.ZodString;
+        response: zod.ZodAny;
+    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
+        type: "INTERACTIVE_MSG_RESPONSE";
+        systemId: "threads";
+        threadId: string;
+        messageId: string;
+        response?: any;
+    }, {
+        type: "INTERACTIVE_MSG_RESPONSE";
+        systemId: "threads";
+        threadId: string;
+        messageId: string;
+        response?: any;
+    }>, zod.ZodObject<{
+        type: zod.ZodLiteral<"FORK_THREAD">;
+        systemId: zod.ZodLiteral<"threads">;
+        messageId: zod.ZodString;
+        threadId: zod.ZodOptional<zod.ZodString>;
+        threadTopic: zod.ZodOptional<zod.ZodString>;
+    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
+        type: "FORK_THREAD";
+        systemId: "threads";
+        messageId: string;
+        threadId?: string | undefined;
+        threadTopic?: string | undefined;
+    }, {
+        type: "FORK_THREAD";
+        systemId: "threads";
+        messageId: string;
+        threadId?: string | undefined;
+        threadTopic?: string | undefined;
+    }>, zod.ZodObject<{
+        type: zod.ZodLiteral<"REVERT_THREAD">;
+        systemId: zod.ZodLiteral<"threads">;
+        messageId: zod.ZodString;
+        threadId: zod.ZodString;
+        restoreFiles: zod.ZodOptional<zod.ZodBoolean>;
+        userCliUuid: zod.ZodOptional<zod.ZodString>;
+    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
+        type: "REVERT_THREAD";
+        systemId: "threads";
+        threadId: string;
+        messageId: string;
+        restoreFiles?: boolean | undefined;
+        userCliUuid?: string | undefined;
+    }, {
+        type: "REVERT_THREAD";
+        systemId: "threads";
+        threadId: string;
+        messageId: string;
+        restoreFiles?: boolean | undefined;
+        userCliUuid?: string | undefined;
+    }>, zod.ZodObject<{
+        type: zod.ZodLiteral<"SUMMARIZE_THREAD">;
+        systemId: zod.ZodLiteral<"threads">;
+        messageId: zod.ZodString;
+        threadId: zod.ZodString;
+    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
+        type: "SUMMARIZE_THREAD";
+        systemId: "threads";
+        threadId: string;
+        messageId: string;
+    }, {
+        type: "SUMMARIZE_THREAD";
+        systemId: "threads";
+        threadId: string;
+        messageId: string;
+    }>, zod.ZodObject<{
+        type: zod.ZodLiteral<"USER_COMMAND">;
+        systemId: zod.ZodLiteral<"threads">;
+        command: zod.ZodString;
+        text: zod.ZodString;
+        mode: zod.ZodOptional<zod.ZodString>;
+        phase: zod.ZodOptional<zod.ZodString>;
+        threadId: zod.ZodOptional<zod.ZodString>;
+        references: zod.ZodOptional<zod.ZodObject<{
+            images: zod.ZodOptional<zod.ZodArray<zod.ZodObject<{
+                url: zod.ZodString;
+                name: zod.ZodString;
+            }, "strip", zod.ZodTypeAny, {
+                url: string;
+                name: string;
+            }, {
+                url: string;
+                name: string;
+            }>, "many">>;
+            files: zod.ZodOptional<zod.ZodArray<zod.ZodObject<{
+                name: zod.ZodString;
+                path: zod.ZodString;
+                typeLabel: zod.ZodString;
+                isImage: zod.ZodBoolean;
+            }, "strip", zod.ZodTypeAny, {
+                path: string;
+                name: string;
+                typeLabel: string;
+                isImage: boolean;
+            }, {
+                path: string;
+                name: string;
+                typeLabel: string;
+                isImage: boolean;
+            }>, "many">>;
+            context: zod.ZodOptional<zod.ZodArray<zod.ZodObject<{
+                refType: zod.ZodEnum<["thread", "document", "note", "task", "tasklist", "folder"]>;
+                refId: zod.ZodString;
+                shortCode: zod.ZodString;
+                label: zod.ZodString;
+            }, "strip", zod.ZodTypeAny, {
+                label: string;
+                shortCode: string;
+                refType: "note" | "document" | "folder" | "tasklist" | "task" | "thread";
+                refId: string;
+            }, {
+                label: string;
+                shortCode: string;
+                refType: "note" | "document" | "folder" | "tasklist" | "task" | "thread";
+                refId: string;
+            }>, "many">>;
+        }, "strip", zod.ZodTypeAny, {
+            context?: {
+                label: string;
+                shortCode: string;
+                refType: "note" | "document" | "folder" | "tasklist" | "task" | "thread";
+                refId: string;
+            }[] | undefined;
+            images?: {
+                url: string;
+                name: string;
+            }[] | undefined;
+            files?: {
+                path: string;
+                name: string;
+                typeLabel: string;
+                isImage: boolean;
+            }[] | undefined;
+        }, {
+            context?: {
+                label: string;
+                shortCode: string;
+                refType: "note" | "document" | "folder" | "tasklist" | "task" | "thread";
+                refId: string;
+            }[] | undefined;
+            images?: {
+                url: string;
+                name: string;
+            }[] | undefined;
+            files?: {
+                path: string;
+                name: string;
+                typeLabel: string;
+                isImage: boolean;
+            }[] | undefined;
+        }>>;
+    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
+        text: string;
+        command: string;
+        type: "USER_COMMAND";
+        systemId: "threads";
+        references?: {
+            context?: {
+                label: string;
+                shortCode: string;
+                refType: "note" | "document" | "folder" | "tasklist" | "task" | "thread";
+                refId: string;
+            }[] | undefined;
+            images?: {
+                url: string;
+                name: string;
+            }[] | undefined;
+            files?: {
+                path: string;
+                name: string;
+                typeLabel: string;
+                isImage: boolean;
+            }[] | undefined;
+        } | undefined;
+        mode?: string | undefined;
+        threadId?: string | undefined;
+        phase?: string | undefined;
+    }, {
+        text: string;
+        command: string;
+        type: "USER_COMMAND";
+        systemId: "threads";
+        references?: {
+            context?: {
+                label: string;
+                shortCode: string;
+                refType: "note" | "document" | "folder" | "tasklist" | "task" | "thread";
+                refId: string;
+            }[] | undefined;
+            images?: {
+                url: string;
+                name: string;
+            }[] | undefined;
+            files?: {
+                path: string;
+                name: string;
+                typeLabel: string;
+                isImage: boolean;
+            }[] | undefined;
+        } | undefined;
+        mode?: string | undefined;
+        threadId?: string | undefined;
+        phase?: string | undefined;
+    }>, zod.ZodObject<{
+        type: zod.ZodLiteral<"UPDATE_CLAUDE_PERMISSION_MODE">;
+        systemId: zod.ZodLiteral<"threads">;
+        threadId: zod.ZodString;
+        mode: zod.ZodString;
+    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
+        type: "UPDATE_CLAUDE_PERMISSION_MODE";
+        systemId: "threads";
+        mode: string;
+        threadId: string;
+    }, {
+        type: "UPDATE_CLAUDE_PERMISSION_MODE";
+        systemId: "threads";
+        mode: string;
+        threadId: string;
+    }>, zod.ZodObject<{
+        type: zod.ZodLiteral<"UPDATE_CLAUDE_WORKTREE">;
+        systemId: zod.ZodLiteral<"threads">;
+        threadId: zod.ZodString;
+        useWorktree: zod.ZodBoolean;
+    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
+        type: "UPDATE_CLAUDE_WORKTREE";
+        systemId: "threads";
+        threadId: string;
+        useWorktree: boolean;
+    }, {
+        type: "UPDATE_CLAUDE_WORKTREE";
+        systemId: "threads";
+        threadId: string;
+        useWorktree: boolean;
+    }>, zod.ZodObject<{
+        type: zod.ZodLiteral<"TOGGLE_COMPACTED">;
+        systemId: zod.ZodLiteral<"threads">;
+        markerId: zod.ZodString;
+        compacted: zod.ZodBoolean;
+    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
+        compacted: boolean;
+        type: "TOGGLE_COMPACTED";
+        systemId: "threads";
+        markerId: string;
+    }, {
+        compacted: boolean;
+        type: "TOGGLE_COMPACTED";
+        systemId: "threads";
+        markerId: string;
     }>] | readonly [zod.ZodObject<{
         type: zod.ZodLiteral<"FLOW_SELECT">;
         systemId: zod.ZodLiteral<"flows">;
@@ -1793,14 +2601,17 @@ declare const events: {
         type: zod.ZodLiteral<"GENERATE_AI_QUERY">;
         systemId: zod.ZodLiteral<"database">;
         prompt: zod.ZodString;
+        mode: zod.ZodOptional<zod.ZodEnum<["query", "transaction"]>>;
     }, zod.UnknownKeysParam, zod.ZodTypeAny, {
         prompt: string;
         type: "GENERATE_AI_QUERY";
         systemId: "database";
+        mode?: "query" | "transaction" | undefined;
     }, {
         prompt: string;
         type: "GENERATE_AI_QUERY";
         systemId: "database";
+        mode?: "query" | "transaction" | undefined;
     }>, zod.ZodObject<{
         type: zod.ZodLiteral<"REFRESH_SCHEMA">;
         systemId: zod.ZodLiteral<"database">;
@@ -2577,24 +3388,6 @@ declare const events: {
         ids: string[];
         targetFolderId: string | null;
     }>, zod.ZodObject<{
-        type: zod.ZodLiteral<"REORDER_ITEMS">;
-        systemId: zod.ZodLiteral<"library">;
-        itemIds: zod.ZodArray<zod.ZodString, "many">;
-        targetIndex: zod.ZodNumber;
-        targetFolderId: zod.ZodNullable<zod.ZodString>;
-    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
-        type: "REORDER_ITEMS";
-        systemId: "library";
-        targetFolderId: string | null;
-        itemIds: string[];
-        targetIndex: number;
-    }, {
-        type: "REORDER_ITEMS";
-        systemId: "library";
-        targetFolderId: string | null;
-        itemIds: string[];
-        targetIndex: number;
-    }>, zod.ZodObject<{
         type: zod.ZodLiteral<"CREATE_SYMLINK_COLLECTION">;
         systemId: zod.ZodLiteral<"library">;
         name: zod.ZodString;
@@ -2612,6 +3405,21 @@ declare const events: {
         name: string;
         symlinkPath: string;
         parentId?: string | undefined;
+    }>, zod.ZodObject<{
+        type: zod.ZodLiteral<"UPDATE_SYMLINK_PATH">;
+        systemId: zod.ZodLiteral<"library">;
+        collectionId: zod.ZodString;
+        newPath: zod.ZodString;
+    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
+        type: "UPDATE_SYMLINK_PATH";
+        systemId: "library";
+        collectionId: string;
+        newPath: string;
+    }, {
+        type: "UPDATE_SYMLINK_PATH";
+        systemId: "library";
+        collectionId: string;
+        newPath: string;
     }>, zod.ZodObject<{
         type: zod.ZodLiteral<"IMPORT_LIBRARY">;
         systemId: zod.ZodLiteral<"library">;
@@ -2713,13 +3521,13 @@ declare const events: {
     }, zod.UnknownKeysParam, zod.ZodTypeAny, {
         type: "explorer.RENAME_FILE";
         systemId: "code";
-        oldPath: string;
         newPath: string;
+        oldPath: string;
     }, {
         type: "explorer.RENAME_FILE";
         systemId: "code";
-        oldPath: string;
         newPath: string;
+        oldPath: string;
     }>, zod.ZodObject<{
         type: zod.ZodLiteral<"explorer.CREATE_DIRECTORY">;
         systemId: zod.ZodLiteral<"code">;
@@ -2967,6 +3775,75 @@ declare const events: {
         type: "commit.GENERATE_MESSAGE";
         systemId: "code";
     }>, zod.ZodObject<{
+        type: zod.ZodLiteral<"commit.STASH_PUSH">;
+        systemId: zod.ZodLiteral<"code">;
+        message: zod.ZodOptional<zod.ZodString>;
+        stagedOnly: zod.ZodOptional<zod.ZodBoolean>;
+    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
+        type: "commit.STASH_PUSH";
+        systemId: "code";
+        message?: string | undefined;
+        stagedOnly?: boolean | undefined;
+    }, {
+        type: "commit.STASH_PUSH";
+        systemId: "code";
+        message?: string | undefined;
+        stagedOnly?: boolean | undefined;
+    }>, zod.ZodObject<{
+        type: zod.ZodLiteral<"commit.STASH_LIST">;
+        systemId: zod.ZodLiteral<"code">;
+    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
+        type: "commit.STASH_LIST";
+        systemId: "code";
+    }, {
+        type: "commit.STASH_LIST";
+        systemId: "code";
+    }>, zod.ZodObject<{
+        type: zod.ZodLiteral<"commit.STASH_APPLY">;
+        systemId: zod.ZodLiteral<"code">;
+        index: zod.ZodNumber;
+    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
+        type: "commit.STASH_APPLY";
+        systemId: "code";
+        index: number;
+    }, {
+        type: "commit.STASH_APPLY";
+        systemId: "code";
+        index: number;
+    }>, zod.ZodObject<{
+        type: zod.ZodLiteral<"commit.STASH_POP">;
+        systemId: zod.ZodLiteral<"code">;
+        index: zod.ZodNumber;
+    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
+        type: "commit.STASH_POP";
+        systemId: "code";
+        index: number;
+    }, {
+        type: "commit.STASH_POP";
+        systemId: "code";
+        index: number;
+    }>, zod.ZodObject<{
+        type: zod.ZodLiteral<"commit.STASH_DROP">;
+        systemId: zod.ZodLiteral<"code">;
+        index: zod.ZodNumber;
+    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
+        type: "commit.STASH_DROP";
+        systemId: "code";
+        index: number;
+    }, {
+        type: "commit.STASH_DROP";
+        systemId: "code";
+        index: number;
+    }>, zod.ZodObject<{
+        type: zod.ZodLiteral<"commit.STASH_CLEAR">;
+        systemId: zod.ZodLiteral<"code">;
+    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
+        type: "commit.STASH_CLEAR";
+        systemId: "code";
+    }, {
+        type: "commit.STASH_CLEAR";
+        systemId: "code";
+    }>, zod.ZodObject<{
         type: zod.ZodLiteral<"pr.GET_BASE_BRANCH">;
         systemId: zod.ZodLiteral<"code">;
     }, zod.UnknownKeysParam, zod.ZodTypeAny, {
@@ -2979,29 +3856,323 @@ declare const events: {
         type: zod.ZodLiteral<"pr.GET_BRANCH_DIFF">;
         systemId: zod.ZodLiteral<"code">;
         baseBranch: zod.ZodOptional<zod.ZodString>;
+        headBranch: zod.ZodOptional<zod.ZodString>;
     }, zod.UnknownKeysParam, zod.ZodTypeAny, {
         type: "pr.GET_BRANCH_DIFF";
         systemId: "code";
         baseBranch?: string | undefined;
+        headBranch?: string | undefined;
     }, {
         type: "pr.GET_BRANCH_DIFF";
         systemId: "code";
         baseBranch?: string | undefined;
+        headBranch?: string | undefined;
     }>, zod.ZodObject<{
         type: zod.ZodLiteral<"pr.GET_BRANCH_FILE_DIFF">;
         systemId: zod.ZodLiteral<"code">;
         path: zod.ZodString;
         baseBranch: zod.ZodString;
+        headBranch: zod.ZodOptional<zod.ZodString>;
     }, zod.UnknownKeysParam, zod.ZodTypeAny, {
         type: "pr.GET_BRANCH_FILE_DIFF";
         systemId: "code";
         path: string;
         baseBranch: string;
+        headBranch?: string | undefined;
     }, {
         type: "pr.GET_BRANCH_FILE_DIFF";
         systemId: "code";
         path: string;
         baseBranch: string;
+        headBranch?: string | undefined;
+    }>, zod.ZodObject<{
+        type: zod.ZodLiteral<"pr.LIST_OPEN_PRS">;
+        systemId: zod.ZodLiteral<"code">;
+    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
+        type: "pr.LIST_OPEN_PRS";
+        systemId: "code";
+    }, {
+        type: "pr.LIST_OPEN_PRS";
+        systemId: "code";
+    }>, zod.ZodObject<{
+        type: zod.ZodLiteral<"pr.SELECT_PR">;
+        systemId: zod.ZodLiteral<"code">;
+        number: zod.ZodNumber;
+    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
+        number: number;
+        type: "pr.SELECT_PR";
+        systemId: "code";
+    }, {
+        number: number;
+        type: "pr.SELECT_PR";
+        systemId: "code";
+    }>, zod.ZodObject<{
+        type: zod.ZodLiteral<"pr.CREATE_PR">;
+        systemId: zod.ZodLiteral<"code">;
+        title: zod.ZodString;
+        body: zod.ZodString;
+        base: zod.ZodOptional<zod.ZodString>;
+        draft: zod.ZodOptional<zod.ZodBoolean>;
+    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
+        type: "pr.CREATE_PR";
+        systemId: "code";
+        title: string;
+        body: string;
+        base?: string | undefined;
+        draft?: boolean | undefined;
+    }, {
+        type: "pr.CREATE_PR";
+        systemId: "code";
+        title: string;
+        body: string;
+        base?: string | undefined;
+        draft?: boolean | undefined;
+    }>, zod.ZodObject<{
+        type: zod.ZodLiteral<"pr.MERGE_PR">;
+        systemId: zod.ZodLiteral<"code">;
+        number: zod.ZodNumber;
+        method: zod.ZodOptional<zod.ZodEnum<["merge", "squash", "rebase"]>>;
+    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
+        number: number;
+        type: "pr.MERGE_PR";
+        systemId: "code";
+        method?: "merge" | "squash" | "rebase" | undefined;
+    }, {
+        number: number;
+        type: "pr.MERGE_PR";
+        systemId: "code";
+        method?: "merge" | "squash" | "rebase" | undefined;
+    }>, zod.ZodObject<{
+        type: zod.ZodLiteral<"pr.CLOSE_PR">;
+        systemId: zod.ZodLiteral<"code">;
+        number: zod.ZodNumber;
+    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
+        number: number;
+        type: "pr.CLOSE_PR";
+        systemId: "code";
+    }, {
+        number: number;
+        type: "pr.CLOSE_PR";
+        systemId: "code";
+    }>, zod.ZodObject<{
+        type: zod.ZodLiteral<"pr.TOGGLE_DRAFT">;
+        systemId: zod.ZodLiteral<"code">;
+        number: zod.ZodNumber;
+        isDraft: zod.ZodBoolean;
+    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
+        number: number;
+        type: "pr.TOGGLE_DRAFT";
+        systemId: "code";
+        isDraft: boolean;
+    }, {
+        number: number;
+        type: "pr.TOGGLE_DRAFT";
+        systemId: "code";
+        isDraft: boolean;
+    }>, zod.ZodObject<{
+        type: zod.ZodLiteral<"pr.CHECK_BRANCH_PR">;
+        systemId: zod.ZodLiteral<"code">;
+    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
+        type: "pr.CHECK_BRANCH_PR";
+        systemId: "code";
+    }, {
+        type: "pr.CHECK_BRANCH_PR";
+        systemId: "code";
+    }>, zod.ZodObject<{
+        type: zod.ZodLiteral<"pr.CHECK_GH_AUTH">;
+        systemId: zod.ZodLiteral<"code">;
+    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
+        type: "pr.CHECK_GH_AUTH";
+        systemId: "code";
+    }, {
+        type: "pr.CHECK_GH_AUTH";
+        systemId: "code";
+    }>, zod.ZodObject<{
+        type: zod.ZodLiteral<"pr.GET_PR_AUTOFILL">;
+        systemId: zod.ZodLiteral<"code">;
+    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
+        type: "pr.GET_PR_AUTOFILL";
+        systemId: "code";
+    }, {
+        type: "pr.GET_PR_AUTOFILL";
+        systemId: "code";
+    }>, zod.ZodObject<{
+        type: zod.ZodLiteral<"pr.GET_SMART_BASE_BRANCH">;
+        systemId: zod.ZodLiteral<"code">;
+    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
+        type: "pr.GET_SMART_BASE_BRANCH";
+        systemId: "code";
+    }, {
+        type: "pr.GET_SMART_BASE_BRANCH";
+        systemId: "code";
+    }>, zod.ZodObject<{
+        type: zod.ZodLiteral<"pr.DELETE_BRANCH">;
+        systemId: zod.ZodLiteral<"code">;
+        branch: zod.ZodString;
+    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
+        type: "pr.DELETE_BRANCH";
+        systemId: "code";
+        branch: string;
+    }, {
+        type: "pr.DELETE_BRANCH";
+        systemId: "code";
+        branch: string;
+    }>, zod.ZodObject<{
+        type: zod.ZodLiteral<"pr.UPDATE_PR">;
+        systemId: zod.ZodLiteral<"code">;
+        number: zod.ZodNumber;
+        title: zod.ZodOptional<zod.ZodString>;
+        body: zod.ZodOptional<zod.ZodString>;
+        base: zod.ZodOptional<zod.ZodString>;
+    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
+        number: number;
+        type: "pr.UPDATE_PR";
+        systemId: "code";
+        title?: string | undefined;
+        body?: string | undefined;
+        base?: string | undefined;
+    }, {
+        number: number;
+        type: "pr.UPDATE_PR";
+        systemId: "code";
+        title?: string | undefined;
+        body?: string | undefined;
+        base?: string | undefined;
+    }>, zod.ZodObject<{
+        type: zod.ZodLiteral<"pr.CREATE_COMMENT">;
+        systemId: zod.ZodLiteral<"code">;
+        number: zod.ZodNumber;
+        body: zod.ZodString;
+    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
+        number: number;
+        type: "pr.CREATE_COMMENT";
+        systemId: "code";
+        body: string;
+    }, {
+        number: number;
+        type: "pr.CREATE_COMMENT";
+        systemId: "code";
+        body: string;
+    }>, zod.ZodObject<{
+        type: zod.ZodLiteral<"pr.EDIT_COMMENT">;
+        systemId: zod.ZodLiteral<"code">;
+        commentId: zod.ZodNumber;
+        body: zod.ZodString;
+    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
+        type: "pr.EDIT_COMMENT";
+        systemId: "code";
+        body: string;
+        commentId: number;
+    }, {
+        type: "pr.EDIT_COMMENT";
+        systemId: "code";
+        body: string;
+        commentId: number;
+    }>, zod.ZodObject<{
+        type: zod.ZodLiteral<"pr.DELETE_COMMENT">;
+        systemId: zod.ZodLiteral<"code">;
+        commentId: zod.ZodNumber;
+    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
+        type: "pr.DELETE_COMMENT";
+        systemId: "code";
+        commentId: number;
+    }, {
+        type: "pr.DELETE_COMMENT";
+        systemId: "code";
+        commentId: number;
+    }>, zod.ZodObject<{
+        type: zod.ZodLiteral<"pr.GET_COMMENTS">;
+        systemId: zod.ZodLiteral<"code">;
+        number: zod.ZodNumber;
+    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
+        number: number;
+        type: "pr.GET_COMMENTS";
+        systemId: "code";
+    }, {
+        number: number;
+        type: "pr.GET_COMMENTS";
+        systemId: "code";
+    }>, zod.ZodObject<{
+        type: zod.ZodLiteral<"pr.GET_REVIEW_THREADS">;
+        systemId: zod.ZodLiteral<"code">;
+        number: zod.ZodNumber;
+    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
+        number: number;
+        type: "pr.GET_REVIEW_THREADS";
+        systemId: "code";
+    }, {
+        number: number;
+        type: "pr.GET_REVIEW_THREADS";
+        systemId: "code";
+    }>, zod.ZodObject<{
+        type: zod.ZodLiteral<"pr.REPLY_TO_THREAD">;
+        systemId: zod.ZodLiteral<"code">;
+        prNumber: zod.ZodNumber;
+        commentId: zod.ZodNumber;
+        body: zod.ZodString;
+    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
+        type: "pr.REPLY_TO_THREAD";
+        systemId: "code";
+        body: string;
+        commentId: number;
+        prNumber: number;
+    }, {
+        type: "pr.REPLY_TO_THREAD";
+        systemId: "code";
+        body: string;
+        commentId: number;
+        prNumber: number;
+    }>, zod.ZodObject<{
+        type: zod.ZodLiteral<"pr.RESOLVE_THREAD">;
+        systemId: zod.ZodLiteral<"code">;
+        threadId: zod.ZodString;
+    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
+        type: "pr.RESOLVE_THREAD";
+        systemId: "code";
+        threadId: string;
+    }, {
+        type: "pr.RESOLVE_THREAD";
+        systemId: "code";
+        threadId: string;
+    }>, zod.ZodObject<{
+        type: zod.ZodLiteral<"pr.UNRESOLVE_THREAD">;
+        systemId: zod.ZodLiteral<"code">;
+        threadId: zod.ZodString;
+    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
+        type: "pr.UNRESOLVE_THREAD";
+        systemId: "code";
+        threadId: string;
+    }, {
+        type: "pr.UNRESOLVE_THREAD";
+        systemId: "code";
+        threadId: string;
+    }>, zod.ZodObject<{
+        type: zod.ZodLiteral<"pr.EDIT_REVIEW_COMMENT">;
+        systemId: zod.ZodLiteral<"code">;
+        commentId: zod.ZodNumber;
+        body: zod.ZodString;
+    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
+        type: "pr.EDIT_REVIEW_COMMENT";
+        systemId: "code";
+        body: string;
+        commentId: number;
+    }, {
+        type: "pr.EDIT_REVIEW_COMMENT";
+        systemId: "code";
+        body: string;
+        commentId: number;
+    }>, zod.ZodObject<{
+        type: zod.ZodLiteral<"pr.DELETE_REVIEW_COMMENT">;
+        systemId: zod.ZodLiteral<"code">;
+        commentId: zod.ZodNumber;
+    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
+        type: "pr.DELETE_REVIEW_COMMENT";
+        systemId: "code";
+        commentId: number;
+    }, {
+        type: "pr.DELETE_REVIEW_COMMENT";
+        systemId: "code";
+        commentId: number;
     }>, zod.ZodObject<{
         type: zod.ZodLiteral<"terminal.CREATE_TERMINAL">;
         systemId: zod.ZodLiteral<"code">;
@@ -3187,9 +4358,9 @@ declare const events: {
         noteType: zod.ZodOptional<zod.ZodEnum<["document", "tasklist", "task"]>>;
         completed: zod.ZodOptional<zod.ZodBoolean>;
     }, zod.UnknownKeysParam, zod.ZodTypeAny, {
-        title: string;
         type: "CREATE_NOTE";
         systemId: "notes";
+        title: string;
         completed?: boolean | undefined;
         content?: string | undefined;
         parentId?: string | undefined;
@@ -3197,9 +4368,9 @@ declare const events: {
         skipContentSync?: boolean | undefined;
         noteType?: "document" | "tasklist" | "task" | undefined;
     }, {
-        title: string;
         type: "CREATE_NOTE";
         systemId: "notes";
+        title: string;
         completed?: boolean | undefined;
         content?: string | undefined;
         parentId?: string | undefined;
@@ -3221,8 +4392,8 @@ declare const events: {
         type: "UPDATE_NOTE";
         systemId: "notes";
         completed?: boolean | undefined;
-        title?: string | undefined;
         content?: string | undefined;
+        title?: string | undefined;
         icon?: string | null | undefined;
         hideCompletedChildren?: boolean | undefined;
         favorite?: boolean | undefined;
@@ -3231,8 +4402,8 @@ declare const events: {
         type: "UPDATE_NOTE";
         systemId: "notes";
         completed?: boolean | undefined;
-        title?: string | undefined;
         content?: string | undefined;
+        title?: string | undefined;
         icon?: string | null | undefined;
         hideCompletedChildren?: boolean | undefined;
         favorite?: boolean | undefined;
@@ -3330,6 +4501,36 @@ declare const events: {
         systemId: "notes";
         query: string;
     }>, zod.ZodObject<{
+        type: zod.ZodLiteral<"GET_TRASHED_NOTES">;
+        systemId: zod.ZodLiteral<"notes">;
+    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
+        type: "GET_TRASHED_NOTES";
+        systemId: "notes";
+    }, {
+        type: "GET_TRASHED_NOTES";
+        systemId: "notes";
+    }>, zod.ZodObject<{
+        type: zod.ZodLiteral<"PERMANENTLY_DELETE_NOTE">;
+        systemId: zod.ZodLiteral<"notes">;
+        id: zod.ZodString;
+    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
+        id: string;
+        type: "PERMANENTLY_DELETE_NOTE";
+        systemId: "notes";
+    }, {
+        id: string;
+        type: "PERMANENTLY_DELETE_NOTE";
+        systemId: "notes";
+    }>, zod.ZodObject<{
+        type: zod.ZodLiteral<"EMPTY_TRASH">;
+        systemId: zod.ZodLiteral<"notes">;
+    }, zod.UnknownKeysParam, zod.ZodTypeAny, {
+        type: "EMPTY_TRASH";
+        systemId: "notes";
+    }, {
+        type: "EMPTY_TRASH";
+        systemId: "notes";
+    }>, zod.ZodObject<{
         type: zod.ZodLiteral<"IMPORT_NOTES">;
         systemId: zod.ZodLiteral<"notes">;
         directory: zod.ZodString;
@@ -3360,6 +4561,7 @@ declare const events: {
     readonly outgoing: {
         type: "SETTINGS_LOADED";
         data: SettingsData;
+        faqs: FAQItem[];
         pluginId: "settings";
     } | {
         type: "SETTINGS_UPDATED";
@@ -3371,13 +4573,14 @@ declare const events: {
         pluginId: "settings";
     } | {
         type: "APPLICATION_HOTKEYS";
-        hotkeys: SettingsData["general"]["hotkeys"];
+        hotkeys: SettingsData["general"]["application"]["hotkeys"];
         pluginId: "settings";
     } | {
         type: "CLI_TEST_RESULT";
         provider: string;
         success: boolean;
         error?: string | undefined;
+        resolvedPath?: string | undefined;
         pluginId: "settings";
     } | {
         type: "SETUP_PACK_IMPORTED";
@@ -3385,6 +4588,21 @@ declare const events: {
         pluginId: "settings";
     } | {
         type: "SETUP_PACK_IMPORT_FAILED";
+        error: string;
+        pluginId: "settings";
+    } | {
+        type: "SETUP_PACK_PREVIEW";
+        preview: SetupPackPreview;
+        pluginId: "settings";
+    } | {
+        type: "SETUP_PACK_PREVIEW_FAILED";
+        error: string;
+        pluginId: "settings";
+    } | {
+        type: "APP_RESET_COMPLETE";
+        pluginId: "settings";
+    } | {
+        type: "APP_RESET_FAILED";
         error: string;
         pluginId: "settings";
     } | {
@@ -3414,65 +4632,6 @@ declare const events: {
         type: "SECRETS.EVENT.ERROR";
         message: string;
         pluginId: "settings";
-    } | {
-        type: "AGENT_CONNECTED";
-        data: AgentConnectedData;
-        pluginId: "agent";
-    } | {
-        type: "LOAD_CHAT_THREAD";
-        data: AgentThreadData;
-        pluginId: "agent";
-    } | {
-        type: "REFRESH_RECENT_THREADS";
-        data: RecentThreadRefreshData;
-        pluginId: "agent";
-    } | {
-        type: "ARTIFACT_ADDED";
-        tabId: string;
-        artifact: any;
-        pluginId: "agent";
-    } | {
-        type: "THREAD_TAB_REQUESTED";
-        threadId: string;
-        topic: string;
-        artifacts: any[];
-        pinned?: boolean | undefined;
-        pluginId: "agent";
-    } | {
-        type: "AGENT_SETTINGS_UPDATED";
-        settings: AgentSettings;
-        pluginId: "agent";
-    } | {
-        type: "API_KEYS_STATUS";
-        hasRequiredApiKeys: boolean;
-        pluginId: "agent";
-    } | {
-        type: "UPDATE_MESSAGE_STATE";
-        messageId: string;
-        text?: string | undefined;
-        blocks?: BlockConfig[] | undefined;
-        responseTimestamp?: number | undefined;
-        blockResponse?: any;
-        pluginId: "agent";
-    } | {
-        type: "MESSAGE_ADDED";
-        threadId: string;
-        message: MessageEntity;
-        pluginId: "agent";
-    } | {
-        type: "UPDATE_TODO_TASK";
-        artifactId: string;
-        taskId: string;
-        completed: boolean;
-        pluginId: "agent";
-    } | {
-        type: "SET_MODE";
-        mode: string;
-        pluginId: "agent";
-    } | {
-        type: "COMMANDS_UPDATED";
-        commands: CommandItem[];
-        pluginId: "agent";
     } | {
         type: "RECEIVE_PLUGIN_DATA";
         data: FlowTNodeData;
@@ -3563,6 +4722,96 @@ declare const events: {
     } | {
         type: "THREADS_IMPORT_FAILED";
         errors: string[];
+        pluginId: "threads";
+    } | {
+        type: "AGENT_CONNECTED";
+        data: AgentConnectedData;
+        pluginId: "threads";
+    } | {
+        type: "LOAD_CHAT_THREAD";
+        data: AgentThreadData;
+        pluginId: "threads";
+    } | {
+        type: "REFRESH_RECENT_THREADS";
+        data: RecentThreadRefreshData;
+        pluginId: "threads";
+    } | {
+        type: "ARTIFACT_ADDED";
+        tabId: string;
+        artifact: any;
+        pluginId: "threads";
+    } | {
+        type: "ARTIFACT_UPDATED";
+        tabId: string;
+        artifact: any;
+        pluginId: "threads";
+    } | {
+        type: "THREAD_TAB_REQUESTED";
+        threadId: string;
+        topic: string;
+        artifacts: any[];
+        pinned?: boolean | undefined;
+        pluginId: "threads";
+    } | {
+        type: "AGENT_SETTINGS_UPDATED";
+        settings: AgentSettings;
+        pluginId: "threads";
+    } | {
+        type: "API_KEYS_STATUS";
+        hasRequiredApiKeys: boolean;
+        pluginId: "threads";
+    } | {
+        type: "UPDATE_MESSAGE_STATE";
+        messageId: string;
+        text?: string | undefined;
+        blocks?: BlockConfig[] | undefined;
+        responseTimestamp?: number | undefined;
+        blockResponse?: BlockResponse | undefined;
+        forkable?: boolean | undefined;
+        status?: "queued" | "cancelled" | null | undefined;
+        context?: Record<string, unknown> | undefined;
+        asideText?: string | undefined;
+        asideContext?: string | undefined;
+        compacted?: boolean | undefined;
+        pluginId: "threads";
+    } | {
+        type: "MESSAGE_ADDED";
+        threadId: string;
+        message: MessageEntity;
+        pluginId: "threads";
+    } | {
+        type: "UPDATE_TODO_TASK";
+        artifactId: string;
+        taskId: string;
+        completed: boolean;
+        pluginId: "threads";
+    } | {
+        type: "SET_MODE";
+        mode: string;
+        pluginId: "threads";
+    } | {
+        type: "SET_PHASE";
+        phase: string;
+        pluginId: "threads";
+    } | {
+        type: "SET_CHAT_STATE";
+        threadId: string;
+        chatState: string;
+        pluginId: "threads";
+    } | {
+        type: "FLASH_CHAT_STATE";
+        threadId: string;
+        stateId: string;
+        durationMs?: number | undefined;
+        pluginId: "threads";
+    } | {
+        type: "COMMANDS_UPDATED";
+        commands: CommandItem[];
+        pluginId: "threads";
+    } | {
+        type: "THREAD_CHAT_ERROR";
+        threadId: string;
+        error: string;
         pluginId: "threads";
     } | {
         type: "FLOWS_CONNECTED";
@@ -3917,6 +5166,12 @@ declare const events: {
         };
         pluginId: "library";
     } | {
+        type: "SYMLINK_UPDATED";
+        data: {
+            collection: CollectionDTO;
+        };
+        pluginId: "library";
+    } | {
         type: "FOLDER_CONTENTS_LOADED";
         data: FolderContents;
         pluginId: "library";
@@ -3943,13 +5198,6 @@ declare const events: {
         type: "ITEMS_MOVED";
         data: {
             ids: string[];
-            targetFolderId: string | null;
-        };
-        pluginId: "library";
-    } | {
-        type: "ITEMS_REORDERED";
-        data: {
-            itemIds: string[];
             targetFolderId: string | null;
         };
         pluginId: "library";
@@ -4136,7 +5384,22 @@ declare const events: {
         };
         pluginId: "code";
     } | {
+        type: "commit.GENERATING_MESSAGE";
+        pluginId: "code";
+    } | {
         type: "commit.MESSAGE_GENERATED";
+        data: {
+            message: string;
+        };
+        pluginId: "code";
+    } | {
+        type: "commit.STASH_LIST_RECEIVED";
+        data: {
+            stashes: StashEntry[];
+        };
+        pluginId: "code";
+    } | {
+        type: "commit.STASH_SUCCESS";
         data: {
             message: string;
         };
@@ -4152,11 +5415,15 @@ declare const events: {
         data: {
             files: GitStatusFile[];
             baseBranch: string;
+            headBranch?: string;
         };
         pluginId: "code";
     } | {
         type: "pr.FILE_DIFF_RECEIVED";
-        data: GitDiff;
+        data: GitDiff & {
+            baseBranch: string;
+            headBranch?: string;
+        };
         pluginId: "code";
     } | {
         type: "pr.ERROR";
@@ -4166,6 +5433,148 @@ declare const events: {
         type: "pr.STATUS_CHANGED";
         data: {
             timestamp: Date;
+        };
+        pluginId: "code";
+    } | {
+        type: "pr.OPEN_PRS_RECEIVED";
+        data: {
+            prs: GhPullRequest[];
+        };
+        pluginId: "code";
+    } | {
+        type: "pr.PR_DETAILS_RECEIVED";
+        data: {
+            pr: GhPullRequest;
+            comments: GhPRComment[];
+            requestId: number;
+        };
+        pluginId: "code";
+    } | {
+        type: "pr.PR_CREATED";
+        data: {
+            pr: GhPullRequest;
+        };
+        pluginId: "code";
+    } | {
+        type: "pr.PR_MERGED";
+        data: {
+            number: number;
+        };
+        pluginId: "code";
+    } | {
+        type: "pr.PR_CLOSED";
+        data: {
+            number: number;
+        };
+        pluginId: "code";
+    } | {
+        type: "pr.PR_DRAFT_TOGGLED";
+        data: {
+            number: number;
+            isDraft: boolean;
+        };
+        pluginId: "code";
+    } | {
+        type: "pr.BRANCH_PR_CHECKED";
+        data: {
+            pr: GhPullRequest | null;
+        };
+        pluginId: "code";
+    } | {
+        type: "pr.GH_AUTH_CHECKED";
+        data: {
+            available: boolean;
+            prAccess: boolean;
+            activeToken: ActiveTokenInfo | null;
+        };
+        pluginId: "code";
+    } | {
+        type: "pr.AUTOFILL_RECEIVED";
+        data: {
+            title: string;
+            body: string;
+        };
+        pluginId: "code";
+    } | {
+        type: "pr.SMART_BASE_BRANCH_RECEIVED";
+        data: {
+            branch: string;
+        };
+        pluginId: "code";
+    } | {
+        type: "pr.BRANCH_DELETED";
+        data: {
+            branch: string;
+        };
+        pluginId: "code";
+    } | {
+        type: "pr.PR_UPDATED";
+        data: {
+            number: number;
+            title?: string;
+            body?: string;
+            base?: string;
+        };
+        pluginId: "code";
+    } | {
+        type: "pr.COMMENT_CREATED";
+        data: {
+            number: number;
+        };
+        pluginId: "code";
+    } | {
+        type: "pr.COMMENT_EDITED";
+        data: {
+            commentId: number;
+        };
+        pluginId: "code";
+    } | {
+        type: "pr.COMMENT_DELETED";
+        data: {
+            commentId: number;
+        };
+        pluginId: "code";
+    } | {
+        type: "pr.COMMENTS_RECEIVED";
+        data: {
+            number: number;
+            comments: GhPRComment[];
+        };
+        pluginId: "code";
+    } | {
+        type: "pr.REVIEW_THREADS_RECEIVED";
+        data: {
+            threads: GhReviewThread[];
+        };
+        pluginId: "code";
+    } | {
+        type: "pr.THREAD_REPLIED";
+        data: {
+            prNumber: number;
+        };
+        pluginId: "code";
+    } | {
+        type: "pr.THREAD_RESOLVED";
+        data: {
+            threadId: string;
+        };
+        pluginId: "code";
+    } | {
+        type: "pr.THREAD_UNRESOLVED";
+        data: {
+            threadId: string;
+        };
+        pluginId: "code";
+    } | {
+        type: "pr.REVIEW_COMMENT_EDITED";
+        data: {
+            commentId: number;
+        };
+        pluginId: "code";
+    } | {
+        type: "pr.REVIEW_COMMENT_DELETED";
+        data: {
+            commentId: number;
         };
         pluginId: "code";
     } | {
@@ -4269,6 +5678,10 @@ declare const events: {
         note: NoteDTO;
         pluginId: "notes";
     } | {
+        type: "TRASHED_NOTES";
+        notes: NoteDTO[];
+        pluginId: "notes";
+    } | {
         type: "NOTES_SEARCH_RESULTS";
         results: NoteDTO[];
         pluginId: "notes";
@@ -4303,6 +5716,8 @@ interface FlowEntity extends BaseEntity {
     description?: string;
     flowType: 'workflow' | 'integration';
     createdAt: number;
+    /** SHA256 hash of the DSL source at last seed. Absent on user-created flows. */
+    sourceHash?: string;
 }
 interface NodeBase extends BaseEntity {
     entityType: EARS.Entity.Node;
@@ -4466,6 +5881,29 @@ interface FlowExtendedData {
     edges: EdgeEntity[];
 }
 
+/**
+ * Setup Pack Preview — reads compiled artifacts from a directory and
+ * reports the top-level items available for selective import.
+ */
+type SetupPackType = 'actions' | 'prompts' | 'flows' | 'library' | 'notes' | 'settings';
+type SetupPackItemKind = 'collection' | 'document' | 'tasklist' | 'task';
+interface SetupPackPreviewItem {
+    key: string;
+    description?: string;
+    kind?: SetupPackItemKind;
+    childCount?: number;
+}
+interface SetupPackPreview {
+    directory: string;
+    actions: SetupPackPreviewItem[];
+    prompts: SetupPackPreviewItem[];
+    flows: SetupPackPreviewItem[];
+    library: SetupPackPreviewItem[];
+    notes: SetupPackPreviewItem[];
+    settings: SetupPackPreviewItem[];
+    missing: SetupPackType[];
+}
+
 interface SafeLinkOptions {
     /** Additional info to store with the relation */
     info?: unknown;
@@ -4523,8 +5961,7 @@ interface SettingsData {
 interface GeneralSettings {
     personal: PersonalInfo;
     secrets: Secrets;
-    hotkeys: ApplicationHotkeys;
-    misc: MiscSettings;
+    application: AppSettings;
     projects: Project[];
 }
 interface Address {
@@ -4566,7 +6003,8 @@ interface ApplicationHotkeys {
     toggleInspectionPanel?: KeyboardShortcut;
     custom?: CustomHotkey[];
 }
-interface MiscSettings {
+interface AppSettings {
+    hotkeys: ApplicationHotkeys;
 }
 interface Project {
     name: string;
@@ -4588,11 +6026,22 @@ interface ThreadTagOption {
     name: string;
     color?: string;
 }
+interface ChatStateConfig {
+    id: string;
+    label: string;
+    color: string;
+    busy: boolean;
+}
 interface ThreadsSettings {
     statuses: ThreadStatusOption[];
     tags: ThreadTagOption[];
+    chatStates: ChatStateConfig[];
     showOnlyRootThreads: boolean;
     clickToChat: boolean;
+    recentThreadsLimit: number;
+    recentThreadsSortOrder: 'created' | 'visited' | 'message';
+    recordingLimitMinutes: number;
+    chat?: AgentSettings;
 }
 interface NotesSettings {
     tasklistPanelPosition: 'left' | 'right';
@@ -4600,6 +6049,7 @@ interface NotesSettings {
 interface LogsSettings {
     maxLogs: number;
     excludedSources: string[];
+    showAppEvents?: boolean;
 }
 interface PluginSettings {
     _meta?: {
@@ -4609,7 +6059,6 @@ interface PluginSettings {
     [pluginId: string]: any;
 }
 interface InternalSettings {
-    tourComplete: boolean;
     hasOnboarded: boolean;
     lastInteractionTimestamp: number | null;
     version: string;
@@ -4618,6 +6067,436 @@ interface InternalSettings {
 interface AssistantSettings {
     name: string;
     birthdate: string | null;
+}
+interface FAQItem {
+    id: string;
+    question: string;
+    answer: string;
+    category?: string;
+    order?: number;
+}
+
+interface FileInfo {
+    name: string;
+    path: string;
+    type: 'file' | 'directory';
+    size?: number;
+    modifiedAt?: Date;
+    extension?: string;
+}
+interface DirectoryContent {
+    path: string;
+    files: FileInfo[];
+}
+interface FileContent {
+    path: string;
+    content: string;
+    encoding: string;
+    size?: number;
+    isBinary?: boolean;
+}
+interface CodeSystemError {
+    code: 'NOT_FOUND' | 'PERMISSION_DENIED' | 'INVALID_PATH' | 'IO_ERROR' | 'FILE_TOO_LARGE' | 'SEARCH_ERROR';
+    message: string;
+    path?: string;
+}
+interface SearchMatch {
+    line: number;
+    column: number;
+    lineText: string;
+    matchStart: number;
+    matchEnd: number;
+}
+interface SearchResult {
+    path: string;
+    matches: SearchMatch[];
+    fileSize?: number;
+}
+interface SearchProgress {
+    filesSearched: number;
+    totalFiles: number;
+    currentFile?: string;
+}
+interface GitStatusFile {
+    path: string;
+    status: 'modified' | 'added' | 'deleted' | 'renamed' | 'untracked' | 'copied' | 'typechange' | 'unmerged';
+    staged: boolean;
+    originalPath?: string;
+    score?: number;
+}
+interface GitDiff {
+    path: string;
+    diff: string;
+    staged: boolean;
+    originalContent?: string;
+    modifiedContent?: string;
+    isImage?: boolean;
+}
+interface StashEntry {
+    index: number;
+    ref: string;
+    message: string;
+    date: string;
+}
+interface GhPullRequest {
+    number: number;
+    title: string;
+    body: string;
+    headRefName: string;
+    baseRefName: string;
+    state: 'OPEN' | 'CLOSED' | 'MERGED';
+    url: string;
+    isDraft: boolean;
+    author: {
+        login: string;
+    };
+    createdAt: string;
+    updatedAt: string;
+    commits?: {
+        oid: string;
+        messageHeadline: string;
+        committedDate: string;
+    }[];
+    mergeable?: 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN';
+    mergeStateStatus?: 'BEHIND' | 'BLOCKED' | 'CLEAN' | 'DIRTY' | 'DRAFT' | 'HAS_HOOKS' | 'UNKNOWN' | 'UNSTABLE';
+    reviewDecision?: 'APPROVED' | 'CHANGES_REQUESTED' | 'REVIEW_REQUIRED' | null;
+    statusCheckRollup?: Array<{
+        name?: string;
+        status?: string;
+        conclusion?: string;
+        state?: string;
+    }>;
+}
+interface GhPRComment {
+    id: string;
+    body: string;
+    author: {
+        login: string;
+    };
+    createdAt: string;
+    url: string;
+    viewerDidAuthor: boolean;
+}
+interface GhReviewThread {
+    id: string;
+    isResolved: boolean;
+    isOutdated: boolean;
+    path: string;
+    line: number | null;
+    comments: GhReviewComment[];
+}
+interface GhReviewComment {
+    id: string;
+    databaseId: number;
+    body: string;
+    author: {
+        login: string;
+    };
+    createdAt: string;
+    viewerDidAuthor: boolean;
+}
+interface TerminalInfo {
+    id: EARS.EntityId;
+    title: string;
+    customTitle?: string;
+    pid: number;
+    shell?: string;
+    cwd: string;
+    active: boolean;
+    cols: number;
+    rows: number;
+}
+interface QuickOpenResult {
+    path: string;
+    relativePath: string;
+    name: string;
+    type: 'file' | 'directory';
+    extension?: string;
+    score?: number;
+}
+interface TerminalScript {
+    id: string;
+    label: string;
+    command: string;
+}
+interface CodeSettings {
+    hotkeys: {
+        openTerminal?: KeyboardShortcut | null;
+        openTerminalTab?: KeyboardShortcut | null;
+        navigatePrevPanel?: KeyboardShortcut | null;
+        navigateNextPanel?: KeyboardShortcut | null;
+        focusSearch?: KeyboardShortcut | null;
+        [key: string]: KeyboardShortcut | null | undefined;
+    };
+    restoreTerminals?: boolean;
+    defaultBaseDirectory?: string | null;
+    lastDirectoryOpened?: string | null;
+    enableShellIntegration?: boolean;
+    confirmTerminalClose?: boolean;
+    closeTerminalOnTabClose?: boolean;
+    maxTerminals?: number;
+    mdEditorDefault?: boolean;
+    enablePreview?: boolean;
+    autoFetchRemote?: boolean;
+    autoFetchIntervalSeconds?: number;
+    terminalScripts?: TerminalScript[];
+}
+type CodeConnectedData = {
+    baseDirectory: string | null;
+    settings?: CodeSettings;
+};
+
+/**
+ * High-level streaming conversation API.
+ *
+ * `query()` spawns `claude -p` in stream-json mode, drives the control loop,
+ * and exposes two things to the caller:
+ *
+ *   - an async iterable of parsed stream events (everything except the
+ *     control-request traffic, which is handled internally)
+ *   - a `result` promise that resolves with the final normalised result
+ *
+ * Two modes, picked by whether an initial `prompt` is provided:
+ *
+ *  1. **Single-turn (default)**: pass `{ prompt }`. The wrapper writes the
+ *     turn, immediately EOFs stdin, and the CLI runs once + exits. Drain
+ *     `handle.events` in a `for await` and then `await handle.result`.
+ *     No cleanup needed — the child unwinds itself.
+ *
+ *  2. **Multi-turn (opt-in)**: pass `{ keepStdinOpen: true, prompt }` OR
+ *     pass no prompt. The wrapper leaves stdin open; the caller drives
+ *     follow-up turns via `handle.send(text)` and MUST call `handle.close()`
+ *     when done. Forgetting to close hangs the child until process exit.
+ *
+ * The implementation uses a fan-out: the raw NDJSON stream from the child is
+ * consumed once by an internal pump that (a) routes control requests to the
+ * control router and (b) pushes everything else into an async queue the
+ * public iterable reads from. This is the only way to share a single Readable
+ * between "internal logic" and "caller" without races.
+ */
+
+interface QueryHandle {
+    /** Resolves with the session id as soon as the CLI emits `system/init`. */
+    readonly sessionId: Promise<string>;
+    /** Every non-control stream line, in order, until the child exits. */
+    readonly events: AsyncIterable<StreamLine>;
+    /** Final normalised result. Rejects on error result or non-zero exit. */
+    readonly result: Promise<QueryResult>;
+    /** Send another user turn. No-op after close(). */
+    send(text: string | UserInputMessage): void;
+    /**
+     * Send a control_response back to the CLI for a surfaced control_request.
+     * Only meaningful when `surfaceControlRequests: true` — in callback mode
+     * the router handles responses internally.
+     */
+    respond(requestId: string, response: {
+        behavior: 'allow' | 'deny';
+        message?: string;
+        updatedInput?: unknown;
+    }): void;
+    /** Ask the CLI to cancel the current turn (interrupt control request). */
+    interrupt(): void;
+    /** Close stdin and wait for the child to exit. */
+    close(): Promise<void>;
+    /** Force-terminate the child process. */
+    kill(): void;
+}
+
+/**
+ * Low-level process primitives for the Claude Code wrapper.
+ *
+ * Two flavours, because the CLI has two very different execution modes:
+ *
+ * 1. `execOnce` — one-shot subcommands (`claude mcp list`, `claude auth status`,
+ *    …). Resolves when the child exits. Uses a bounded timeout. Translates
+ *    spawn/exit errors into typed `ClaudeCodeError` subclasses.
+ *
+ * 2. `spawnStream` — long-lived `claude -p --input-format stream-json
+ *    --output-format stream-json` for interactive conversations. Returns a
+ *    handle the caller uses to push user turns (stdin) and iterate events
+ *    (stdout) until the child exits. Abort via `AbortSignal`.
+ *
+ * Neither primitive knows anything about the wire protocol — they just move
+ * bytes. The stream-json schema lives in `types.ts` and parsing in `ndjson.ts`.
+ */
+
+interface ExecOnceOptions {
+    cwd?: string;
+    /**
+     * Override the env passed to the child. Defaults to a copy of `process.env`
+     * with `ANTHROPIC_API_KEY` removed so the CLI uses its own stored auth
+     * (`claude auth login`) instead of an env-var key meant for the server's
+     * LLM client. Pass an explicit object if you want no scrubbing — the
+     * helper assumes you know what you're doing and does not post-process it.
+     */
+    env?: NodeJS.ProcessEnv;
+    /** Bytes piped to stdin. Pass `undefined` to leave stdin closed. */
+    input?: string;
+    /** Milliseconds until the child is SIGKILL'd and a ClaudeTimeoutError thrown. */
+    timeoutMs?: number;
+    signal?: AbortSignal;
+    /** Override the resolved CLI path (primarily for testing). */
+    cliPath?: string;
+}
+interface ExecOnceResult {
+    stdout: string;
+    stderr: string;
+    exitCode: number;
+}
+
+interface SessionInfo {
+    id: string;
+    file: string;
+    cwd?: string;
+    title?: string;
+    tags?: string[];
+    modifiedAt: Date;
+    size: number;
+    firstMessageAt?: Date;
+    lastMessageAt?: Date;
+}
+interface SessionTranscriptEntry {
+    type?: string;
+    [key: string]: unknown;
+}
+interface SessionListOptions {
+    /** Working directory whose sessions to list. Defaults to `process.cwd()`. */
+    cwd?: string;
+    limit?: number;
+    offset?: number;
+}
+interface SessionViewOptions {
+    cwd?: string;
+    limit?: number;
+    offset?: number;
+}
+
+/**
+ * `claude auth` — login, logout, status.
+ *
+ * `login` is interactive by nature (opens a browser for Claude.ai, prompts
+ * for SSO, etc.); we expose it anyway for completeness but callers should
+ * usually delegate to the CLI UI rather than call this programmatically.
+ */
+
+/** Shape of `claude auth status --json` — passthrough, CLI may add fields. */
+interface AuthStatus {
+    authenticated?: boolean;
+    /** Claude Max / claude.ai subscriptions return `loggedIn` instead of `authenticated`. */
+    loggedIn?: boolean;
+    source?: 'user' | 'project' | 'org' | 'temporary' | 'oauth';
+    authMethod?: string;
+    apiProvider?: string;
+    account?: Record<string, unknown>;
+    [key: string]: unknown;
+}
+
+interface CliServiceType {
+    git: {
+        commit(message: string): Promise<void>;
+        getStatus(): Promise<GitStatusFile[]>;
+        getCurrentBranch(): Promise<string>;
+        getWorkingDir(): string;
+        /**
+         * Return the unified diff for the working copy vs HEAD. Pass a list of
+         * paths to restrict to specific files; omit to get all changes. Used by
+         * the Claude Code chat action to assemble a `diff` artifact after file-
+         * mutating tool calls (Write/Edit/NotebookEdit).
+         */
+        getDiff(paths?: string[]): Promise<string>;
+    };
+    gh: {
+        getPRForBranch(branch?: string): Promise<GhPullRequest | null>;
+        getPRDetails(number: number, repo?: {
+            owner: string;
+            name: string;
+        }): Promise<GhPullRequest & {
+            comments: GhPRComment[];
+        }>;
+        getReviewThreads(number: number, repo?: {
+            owner: string;
+            name: string;
+        }): Promise<GhReviewThread[]>;
+    };
+    /**
+     * Claude Code wrapper. Highlights only — the full surface (sessions, mcp,
+     * plugins, skills, …) is available via `import { claudeCode } from
+     * '@/services/claude-code'`.
+     */
+    /** Clear-cache resolve + exec test — same path as the Settings test button. */
+    testCli(provider: string): Promise<{
+        success: true;
+        resolvedPath: string;
+    } | {
+        success: false;
+        error: string;
+    }>;
+    claudeCode: {
+        query(opts: Omit<QueryOptions, 'cwd'> & {
+            cwd?: string;
+        }): Promise<QueryHandle>;
+        version(): Promise<string>;
+        authStatus(): Promise<AuthStatus>;
+        listSessions(opts?: SessionListOptions): Promise<SessionInfo[]>;
+        /** List sessions across ALL project directories (not just the configured cwd). */
+        listAllSessions(opts?: {
+            limit?: number;
+        }): Promise<SessionInfo[]>;
+        /**
+         * Parse a session's JSONL transcript into an in-memory array of entries.
+         * Used by `CC: Handle Rewind` to retroactively backfill `context.cliUuid`
+         * on pre-existing user messages from Claude's own session file.
+         * `cwd` defaults to the configured project directory.
+         */
+        viewSession(id: string, opts?: Omit<SessionViewOptions, 'cwd'> & {
+            cwd?: string;
+        }): Promise<SessionTranscriptEntry[]>;
+        /** Parse a JSONL file directly by path (bypasses cwd→bucket lookup). */
+        viewSessionByFile(filePath: string, opts?: {
+            limit?: number;
+            offset?: number;
+        }): Promise<SessionTranscriptEntry[]>;
+        getWorkingDir(): string;
+        /** Store a live query handle so other actions can write control_responses. */
+        storeHandle(key: string, handle: QueryHandle): void;
+        /** Retrieve a stored query handle by key (typically threadId). */
+        getHandle(key: string): QueryHandle | undefined;
+        /** Clear a stored handle (call on query end to avoid leaking references). */
+        clearHandle(key: string): void;
+        /**
+         * Low-level one-shot CLI invocation. Used by `CC: Handle Revert` to run
+         * `claude --resume <sid> --rewind-files <uuid>` for file-rewind on revert.
+         * `cwd` defaults to the configured project directory.
+         */
+        exec(args: readonly string[], opts?: Omit<ExecOnceOptions, 'cwd'> & {
+            cwd?: string;
+        }): Promise<ExecOnceResult>;
+        /** Read the CLI's user-scope settings.json (~/.claude/settings.json). */
+        readSettings(): Promise<Record<string, any>>;
+        /** Write the CLI's user-scope settings.json (~/.claude/settings.json). */
+        writeSettings(settings: Record<string, any>): Promise<void>;
+        /** List skill files from user (~/.claude/skills/) and project (.claude/skills/) dirs. */
+        listSkills(): Promise<Array<{
+            name: string;
+            scope: string;
+            path: string;
+        }>>;
+        /** List memory/CLAUDE.md files from known locations. */
+        listMemoryFiles(): Promise<Array<{
+            name: string;
+            scope: string;
+            path: string;
+        }>>;
+    };
+}
+
+interface TextStreamOptions {
+    chunkSize?: number;
+    delayMs?: number;
+}
+declare class TextStreamService {
+    streamText(text: string, options?: TextStreamOptions): AsyncGenerator<string, void, unknown>;
+    streamTextByChars(text: string, options?: TextStreamOptions): AsyncGenerator<string, void, unknown>;
 }
 
 /**
@@ -4841,7 +6720,7 @@ type DistributiveOmit<T, K extends keyof any> = T extends any ? Omit<T, K> : nev
  * @param pluginId - The target plugin ID (or 'application' for main plugin)
  * @param event - The event to emit (without pluginId)
  * @example
- * sendToPlugin('agent', {
+ * sendToPlugin('threads', {
  *   type: 'TOKEN_STREAM',
  *   token: 'Hello'
  * });
@@ -4914,7 +6793,7 @@ declare function createEntityWithDefaults<T extends {
     entityType: EARS.Entity;
     shortCode?: string;
     label?: string;
-}>(entityType: EARS.Entity, data: Partial<T>, prefix?: string): T & {
+}>(entityType: EARS.Entity, data: Partial<T>, prefix?: string, providedId?: EARS.EntityId): T & {
     id: EARS.EntityId;
 };
 declare function updateEntity(id: EARS.EntityId, updates: Record<string, any>, skipTimestamp?: boolean): void;
@@ -5027,8 +6906,19 @@ declare function findFirstWithRole<T>(entityType: EARS.Entity, role: string): T 
  * including EARS transaction and query utilities.
  */
 
+/**
+ * Build a query context from live data for AI query generation.
+ * Samples one entity per type to extract real attribute names + values,
+ * and maps the relationship topology.
+ */
+declare function buildQueryContext(): {
+    schema: string;
+    topology: string;
+};
+
 import database_EARS = EARS;
 type database_SafeLinkOptions = SafeLinkOptions;
+declare const database_buildQueryContext: typeof buildQueryContext;
 declare const database_countEntities: typeof countEntities;
 declare const database_createEntityWithDefaults: typeof createEntityWithDefaults;
 declare const database_createRelation: typeof createRelation;
@@ -5049,7 +6939,7 @@ declare const database_revokeRole: typeof revokeRole;
 declare const database_tx: typeof tx;
 declare const database_updateEntity: typeof updateEntity;
 declare namespace database {
-  export { database_EARS as EARS, database_countEntities as countEntities, database_createEntityWithDefaults as createEntityWithDefaults, database_createRelation as createRelation, database_exists as exists, database_findAll as findAll, database_findById as findById, database_findByIdWithFields as findByIdWithFields, database_findFirst as findFirst, database_findFirstWithRole as findFirstWithRole, database_findWhere as findWhere, database_findWithFields as findWithFields, database_findWithRole as findWithRole, database_grantRole as grantRole, database_prepareEntity as prepareEntity, database_qx as qx, database_removeRelation as removeRelation, database_revokeRole as revokeRole, database_tx as tx, database_updateEntity as updateEntity };
+  export { database_EARS as EARS, database_buildQueryContext as buildQueryContext, database_countEntities as countEntities, database_createEntityWithDefaults as createEntityWithDefaults, database_createRelation as createRelation, database_exists as exists, database_findAll as findAll, database_findById as findById, database_findByIdWithFields as findByIdWithFields, database_findFirst as findFirst, database_findFirstWithRole as findFirstWithRole, database_findWhere as findWhere, database_findWithFields as findWithFields, database_findWithRole as findWithRole, database_grantRole as grantRole, database_prepareEntity as prepareEntity, database_qx as qx, database_removeRelation as removeRelation, database_revokeRole as revokeRole, database_tx as tx, database_updateEntity as updateEntity };
   export type { database_SafeLinkOptions as SafeLinkOptions };
 }
 
@@ -5088,7 +6978,7 @@ declare class BrowserService {
     getAttribute(selector: string, attribute: string): Promise<string | null>;
     isVisible(selector: string): Promise<boolean>;
     isEnabled(selector: string): Promise<boolean>;
-    waitForSelector(selector: string, timeout?: number): Promise<ElementHandle<Element> | null>;
+    waitForSelector(selector: string, timeout?: number): Promise<ElementHandle | null>;
     waitForTimeout(timeout: number): Promise<void>;
     waitForLoadState(state?: 'load' | 'domcontentloaded' | 'networkidle'): Promise<void>;
     screenshot(path?: string): Promise<Buffer>;
@@ -5139,12 +7029,22 @@ declare namespace browser {
  * These helpers make it easy to create messages using reusable blocks that can be
  * mixed and matched to create complex interactions.
  */
-interface BlockMessageOptions {
+interface BlockMessageBase {
     threadId: EARS.EntityId;
     text: string;
     blocks: BlockConfig[];
     forkable?: boolean;
 }
+type AutoHideOptions = {
+    autoHide: true;
+    asUser: boolean;
+    asideContext?: string;
+} | {
+    autoHide?: false;
+    asUser?: undefined;
+    asideContext?: undefined;
+};
+type BlockMessageOptions = BlockMessageBase & AutoHideOptions;
 /**
  * Create a message with custom blocks (pure function)
  * Returns message data without side effects
@@ -5172,7 +7072,7 @@ declare function sendFilePickerBlock(options: {
     allowMultiple?: boolean;
     displayText?: string;
     forkable?: boolean;
-}): {
+} & AutoHideOptions): {
     messageId: EARS.EntityId;
 };
 /**
@@ -5189,9 +7089,34 @@ declare function sendChoiceBlock(options: {
     }>;
     multiSelect?: boolean;
     allowCustom?: boolean;
+    compact?: boolean;
     displayText?: string;
     forkable?: boolean;
-}): {
+} & AutoHideOptions): {
+    messageId: EARS.EntityId;
+};
+/**
+ * Create a question interaction — single question or multi-question wizard.
+ * Single question = array with one item. Multi = step wizard in the frontend.
+ * Response shape: string (single) or Record<string, string> (multi).
+ */
+declare function sendQuestionBlock(options: {
+    threadId: EARS.EntityId;
+    text: string;
+    prompt: string;
+    questions: Array<{
+        question: string;
+        header?: string;
+        options: Array<{
+            id: string;
+            label: string;
+            description?: string;
+        }>;
+        multiSelect?: boolean;
+        allowCustom?: boolean;
+    }>;
+    forkable?: boolean;
+} & AutoHideOptions): {
     messageId: EARS.EntityId;
 };
 /**
@@ -5205,7 +7130,7 @@ declare function sendApprovalBlock(options: {
     requireReason?: boolean;
     allowReason?: boolean;
     forkable?: boolean;
-}): {
+} & AutoHideOptions): {
     messageId: EARS.EntityId;
 };
 /**
@@ -5221,7 +7146,7 @@ declare function sendTextInputBlock(options: {
     displayText?: string;
     suggestions?: string[];
     forkable?: boolean;
-}): {
+} & AutoHideOptions): {
     messageId: EARS.EntityId;
 };
 /**
@@ -5308,7 +7233,7 @@ declare function sendButtonGroupBlock(options: {
     keepInteractive?: boolean;
     displayText?: string;
     forkable?: boolean;
-}): {
+} & AutoHideOptions): {
     messageId: EARS.EntityId;
 };
 /**
@@ -5333,7 +7258,31 @@ declare function updateMessageBlockResponse(messageId: EARS.EntityId, response: 
  *   text: 'Updated message content'
  * });
  */
-declare function updateMessageState(messageId: EARS.EntityId, updates: Partial<Pick<MessageEntity, 'text' | 'blocks' | 'blockResponse' | 'responseTimestamp'>>): void;
+declare function updateMessageState(messageId: EARS.EntityId, updates: Partial<Pick<MessageEntity, 'text' | 'blocks' | 'blockResponse' | 'responseTimestamp' | 'status' | 'context' | 'forkable' | 'compacted'>>): void;
+/**
+ * Create a marker message that compacts eligible prior messages in a thread.
+ * The repository determines which messages are eligible (excludes markers and already-compacted).
+ */
+declare function createMarkerMessage(params: {
+    threadId: EARS.EntityId;
+    text: string;
+}): {
+    messageId: EARS.EntityId;
+    compactedMessageIds: EARS.EntityId[];
+};
+/**
+ * Add multiple messages to a thread without emitting per-message frontend events.
+ * Caller is responsible for refreshing the frontend afterwards (e.g. via LOAD_CHAT_THREAD).
+ */
+declare function addMessagesToThread(params: {
+    threadId: EARS.EntityId;
+    messages: Array<{
+        text: string;
+        sender: 'user' | 'assistant' | 'system' | 'marker';
+        forkable?: boolean;
+        context?: Record<string, unknown>;
+    }>;
+}): void;
 /**
  * Create a new thread and notify the frontend
  * Use this in flow actions that need automatic frontend updates
@@ -5382,38 +7331,49 @@ declare function openThreadTabAndRefresh(threadId: EARS.EntityId): void;
  * - Thread visits (updates lastVisitedTimestamp)
  */
 declare function sendRecentThreadsRefresh(): void;
+/**
+ * Resolve all message reference types (images, files, notes, threads,
+ * library docs/folders) into prompt-ready content for the Claude Code CLI.
+ *
+ * Returns:
+ * - `textPrefix`  — formatted text for non-image references, prepended to the user message
+ * - `imageBlocks` — Anthropic image content blocks (base64-encoded), with text labels
+ * - `addDirs`     — directories for `--add-dir` (attached file auto-reads)
+ */
+declare function resolveReferences(references: MessageReferences | undefined): Promise<{
+    textPrefix: string;
+    imageBlocks: any[];
+    addDirs: string[];
+}>;
+/**
+ * Generate a compact aside summary for a collapsed interactive message.
+ * Pure function — no side effects.
+ */
+declare function generateAsideText(message: MessageEntity, response: BlockResponse): string;
 
+type chat_AutoHideOptions = AutoHideOptions;
+declare const chat_addMessagesToThread: typeof addMessagesToThread;
 declare const chat_createBlockMessage: typeof createBlockMessage;
+declare const chat_createMarkerMessage: typeof createMarkerMessage;
 declare const chat_createThreadAndNotify: typeof createThreadAndNotify;
+declare const chat_generateAsideText: typeof generateAsideText;
 declare const chat_openThreadChatAndRefreshRecent: typeof openThreadChatAndRefreshRecent;
 declare const chat_openThreadTabAndRefresh: typeof openThreadTabAndRefresh;
+declare const chat_resolveReferences: typeof resolveReferences;
 declare const chat_sendApprovalBlock: typeof sendApprovalBlock;
 declare const chat_sendBlockMessage: typeof sendBlockMessage;
 declare const chat_sendButtonGroupBlock: typeof sendButtonGroupBlock;
 declare const chat_sendChoiceBlock: typeof sendChoiceBlock;
 declare const chat_sendFilePickerBlock: typeof sendFilePickerBlock;
 declare const chat_sendLinkBlock: typeof sendLinkBlock;
+declare const chat_sendQuestionBlock: typeof sendQuestionBlock;
 declare const chat_sendRecentThreadsRefresh: typeof sendRecentThreadsRefresh;
 declare const chat_sendTextInputBlock: typeof sendTextInputBlock;
 declare const chat_updateMessageBlockResponse: typeof updateMessageBlockResponse;
 declare const chat_updateMessageState: typeof updateMessageState;
 declare namespace chat {
-  export {
-    chat_createBlockMessage as createBlockMessage,
-    chat_createThreadAndNotify as createThreadAndNotify,
-    chat_openThreadChatAndRefreshRecent as openThreadChatAndRefreshRecent,
-    chat_openThreadTabAndRefresh as openThreadTabAndRefresh,
-    chat_sendApprovalBlock as sendApprovalBlock,
-    chat_sendBlockMessage as sendBlockMessage,
-    chat_sendButtonGroupBlock as sendButtonGroupBlock,
-    chat_sendChoiceBlock as sendChoiceBlock,
-    chat_sendFilePickerBlock as sendFilePickerBlock,
-    chat_sendLinkBlock as sendLinkBlock,
-    chat_sendRecentThreadsRefresh as sendRecentThreadsRefresh,
-    chat_sendTextInputBlock as sendTextInputBlock,
-    chat_updateMessageBlockResponse as updateMessageBlockResponse,
-    chat_updateMessageState as updateMessageState,
-  };
+  export { chat_addMessagesToThread as addMessagesToThread, chat_createBlockMessage as createBlockMessage, chat_createMarkerMessage as createMarkerMessage, chat_createThreadAndNotify as createThreadAndNotify, chat_generateAsideText as generateAsideText, chat_openThreadChatAndRefreshRecent as openThreadChatAndRefreshRecent, chat_openThreadTabAndRefresh as openThreadTabAndRefresh, chat_resolveReferences as resolveReferences, chat_sendApprovalBlock as sendApprovalBlock, chat_sendBlockMessage as sendBlockMessage, chat_sendButtonGroupBlock as sendButtonGroupBlock, chat_sendChoiceBlock as sendChoiceBlock, chat_sendFilePickerBlock as sendFilePickerBlock, chat_sendLinkBlock as sendLinkBlock, chat_sendQuestionBlock as sendQuestionBlock, chat_sendRecentThreadsRefresh as sendRecentThreadsRefresh, chat_sendTextInputBlock as sendTextInputBlock, chat_updateMessageBlockResponse as updateMessageBlockResponse, chat_updateMessageState as updateMessageState };
+  export type { chat_AutoHideOptions as AutoHideOptions };
 }
 
 /**
@@ -5427,6 +7387,12 @@ interface CreateArtifactOptions {
     artifactType: ArtifactType;
     title: string;
     content: any;
+    threadId?: EARS.EntityId;
+}
+interface UpdateArtifactOptions {
+    title?: string;
+    content?: unknown;
+    /** Thread to emit the ARTIFACT_UPDATED event for. If omitted, no event is sent. */
     threadId?: EARS.EntityId;
 }
 /**
@@ -5452,12 +7418,36 @@ interface CreateArtifactOptions {
 declare function createAndNotify(options: CreateArtifactOptions): {
     artifactId: EARS.EntityId;
 };
+/**
+ * Patch an existing artifact's title and/or content in place, and notify
+ * the frontend so the panel re-renders with the new data.
+ *
+ * Used for artifacts that mutate across turns (e.g. the Claude Code session
+ * card, which tracks live status/cost/turn count). The `ARTIFACT_UPDATED`
+ * event mirrors `ARTIFACT_ADDED` but carries only the fields that changed.
+ */
+declare function updateAndNotify(artifactId: EARS.EntityId, options: UpdateArtifactOptions): void;
+/**
+ * Find-or-create an artifact by (thread, artifactType). Guarantees at most
+ * one artifact of the given type per thread. Useful for singletons like the
+ * Claude Code session card that should only ever exist once per thread.
+ */
+declare function findOrCreateByType(threadId: EARS.EntityId, artifactType: ArtifactType, initial: {
+    title: string;
+    content: any;
+}): {
+    artifactId: EARS.EntityId;
+    created: boolean;
+};
 
 type artifact_CreateArtifactOptions = CreateArtifactOptions;
+type artifact_UpdateArtifactOptions = UpdateArtifactOptions;
 declare const artifact_createAndNotify: typeof createAndNotify;
+declare const artifact_findOrCreateByType: typeof findOrCreateByType;
+declare const artifact_updateAndNotify: typeof updateAndNotify;
 declare namespace artifact {
-  export { artifact_createAndNotify as createAndNotify };
-  export type { artifact_CreateArtifactOptions as CreateArtifactOptions };
+  export { artifact_createAndNotify as createAndNotify, artifact_findOrCreateByType as findOrCreateByType, artifact_updateAndNotify as updateAndNotify };
+  export type { artifact_CreateArtifactOptions as CreateArtifactOptions, artifact_UpdateArtifactOptions as UpdateArtifactOptions };
 }
 
 interface BrainEventPayload {
@@ -5551,6 +7541,29 @@ declare namespace media {
   export type { media_ImagePart as ImagePart };
 }
 
+/**
+ * Threads Service
+ *
+ * Provides primitives for updating thread-level state with automatic
+ * frontend notification, following the same pattern as artifact service.
+ */
+
+/**
+ * Update a thread's chatState and notify the frontend.
+ *
+ * This is the canonical service-level write for chatState. The DSL helper
+ * `updateChatState()` in session-artifact.ts handles the artifact side,
+ * then delegates here for the thread write + emit.
+ */
+declare function updateChatState(threadId: EARS.EntityId, chatState: string): void;
+
+declare const threads_updateChatState: typeof updateChatState;
+declare namespace threads {
+  export {
+    threads_updateChatState as updateChatState,
+  };
+}
+
 declare const services: {
     logger: {
         source?: string;
@@ -5594,6 +7607,7 @@ declare const services: {
                 input?: Record<string, any>;
                 actionFn: string;
                 output?: any;
+                sourceHash?: string;
             }) => ActionEntity;
             readonly update: (id: EARS.EntityId, updates: {
                 label?: string;
@@ -5602,32 +7616,36 @@ declare const services: {
                 input?: Record<string, any>;
                 actionFn?: string;
                 output?: any;
+                sourceHash?: string;
             }) => void;
             readonly delete: (id: EARS.EntityId) => void;
         };
-        readonly agentQueries: {
+        readonly chatQueries: {
             readonly hasRequiredApiKeys: () => boolean;
-            readonly threadArtifacts: (threadId: EARS.EntityId) => {
-                id: `Agent-${string}` | `Brain-${string}` | `Message-${string}` | `Thread-${string}` | `Relation-${string}` | `Artifact-${string}` | `Flow-${string}` | `Node-${string}` | `TNode-${string}` | `Prompt-${string}` | `Action-${string}` | `Document-${string}` | `Collection-${string}` | `SearchIndex-${string}` | `IndexedDoc-${string}` | `Terminal-${string}` | `Directory-${string}` | `Settings-${string}` | `FAQ-${string}` | `Secret-${string}` | `Note-${string}`;
-                type: unknown;
-                title: unknown;
-                content: unknown;
-            }[];
+            readonly threadArtifacts: (threadId: EARS.EntityId) => ArtifactItem[];
             readonly threadData: (threadId: EARS.EntityId) => AgentThreadData;
             readonly refreshThreadsData: () => RecentThreadRefreshData;
             readonly connectedData: () => AgentConnectedData;
             readonly messageById: (messageId: EARS.EntityId) => MessageEntity | null;
         };
-        readonly agentCommands: {
+        readonly chatCommands: {
             readonly addMessage: (params: {
                 threadId: EARS.EntityId;
                 text: string;
-                sender: "user" | "assistant" | "system";
+                sender: "user" | "assistant" | "system" | "marker";
                 blocks?: BlockConfig[];
                 forkable?: boolean;
                 references?: MessageReferences;
                 isCommand?: boolean;
                 command?: string;
+                autoHide?: boolean;
+                asUser?: boolean;
+                asideContext?: string;
+                blockResponse?: any;
+                responseTimestamp?: number;
+                asideText?: string;
+                compacted?: boolean;
+                context?: Record<string, unknown>;
             }) => {
                 id: EARS.EntityId;
                 threadId: EARS.EntityId;
@@ -5637,7 +7655,9 @@ declare const services: {
             };
             readonly createThreadFromMessage: (text: string) => {
                 threadId: EARS.EntityId;
-                threadData: ReturnType<(input: ThreadCreateData) => {
+                threadData: ReturnType<(input: ThreadCreateData & {
+                    id?: string;
+                }) => {
                     id: EARS.EntityId;
                     shortCode: string;
                     timestamp: number;
@@ -5655,12 +7675,24 @@ declare const services: {
             };
             readonly updateMessageState: (params: {
                 messageId: EARS.EntityId;
-                updates: Partial<Pick<MessageEntity, "text" | "blocks" | "blockResponse" | "responseTimestamp">>;
+                updates: Partial<Pick<MessageEntity, "text" | "blocks" | "blockResponse" | "responseTimestamp" | "forkable" | "status" | "context" | "compacted">>;
             }) => {
                 messageId: EARS.EntityId;
                 updatedAt: number;
                 updates: typeof params.updates;
             };
+            readonly createMarkerMessage: (params: {
+                threadId: EARS.EntityId;
+                text: string;
+            }) => {
+                id: EARS.EntityId;
+                threadId: EARS.EntityId;
+                text: string;
+                sender: string;
+                timestamp: number;
+                compactedMessageIds: EARS.EntityId[];
+            };
+            readonly toggleMarkerCompacted: (markerId: EARS.EntityId, compacted: boolean) => EARS.EntityId[];
             readonly copyMessagesUpTo: (params: {
                 sourceThreadId: EARS.EntityId;
                 targetThreadId: EARS.EntityId;
@@ -5681,6 +7713,11 @@ declare const services: {
             }) => {
                 artifactId: EARS.EntityId;
             };
+            readonly updateArtifact: (artifactId: EARS.EntityId, patch: {
+                title?: string;
+                content?: unknown;
+            }) => void;
+            readonly findArtifactByType: (threadId: EARS.EntityId, artifactType: ArtifactType) => ArtifactEntity | undefined;
         };
         readonly brainQueries: {
             readonly rootFlowTNode: () => EARS.EntityId | undefined;
@@ -5770,20 +7807,20 @@ declare const services: {
             readonly getAllDocuments: () => DocumentDTO[];
         };
         readonly libraryCommands: {
-            readonly createDocument: (name: string, content: ContentSection[], tags: string[], collectionId?: EARS.EntityId) => DocumentDTO;
-            readonly updateDocument: (id: EARS.EntityId, name: string, content: ContentSection[], tags: string[], collectionId?: EARS.EntityId) => DocumentDTO;
+            readonly createDocument: (name: string, content: ContentSection[], tags: string[], collectionId?: EARS.EntityId, id?: string, sourceHash?: string) => DocumentDTO;
+            readonly updateDocument: (id: EARS.EntityId, name: string, content: ContentSection[], tags: string[], collectionId?: EARS.EntityId, sourceHash?: string) => DocumentDTO;
             readonly deleteDocument: (id: EARS.EntityId) => void;
-            readonly createCollection: (name: string, description?: string, parentId?: EARS.EntityId) => CollectionDTO;
-            readonly updateCollection: (id: EARS.EntityId, name: string, description?: string) => CollectionDTO;
+            readonly createCollection: (name: string, description?: string, parentId?: EARS.EntityId, id?: string, sourceHash?: string) => CollectionDTO;
+            readonly updateCollection: (id: EARS.EntityId, name: string, description?: string, sourceHash?: string) => CollectionDTO;
             readonly deleteCollection: (id: EARS.EntityId) => void;
             readonly moveDocument: (documentId: EARS.EntityId, newCollectionId?: EARS.EntityId) => DocumentDTO;
             readonly renameItem: (id: EARS.EntityId, name: string, type: "document" | "folder") => LibraryItem;
             readonly deleteItems: (ids: EARS.EntityId[]) => void;
             readonly moveItems: (ids: EARS.EntityId[], targetFolderId: EARS.EntityId | null) => void;
-            readonly reorderItems: (itemIds: EARS.EntityId[], targetIndex: number, targetFolderId: EARS.EntityId | null) => void;
             readonly migrateDocumentShortCodes: () => void;
             readonly migrateDisplayOrders: () => void;
-            readonly createSymlinkCollection: (name: string, symlinkPath: string, parentId?: EARS.EntityId) => CollectionDTO;
+            readonly createSymlinkCollection: (name: string, symlinkPath: string, parentId?: EARS.EntityId, id?: string) => CollectionDTO;
+            readonly updateSymlinkPath: (collectionId: EARS.EntityId, newPath: string) => CollectionDTO;
             readonly updateDocumentTags: (documentId: EARS.EntityId, tags: string[]) => void;
         };
         readonly promptQueries: {
@@ -5804,6 +7841,7 @@ declare const services: {
                 templateFn: string;
                 inputs?: Record<string, any>;
                 category?: string;
+                sourceHash?: string;
             }) => PromptEntity;
             update: (id: EARS.EntityId, updates: {
                 label?: string;
@@ -5811,6 +7849,7 @@ declare const services: {
                 templateFn?: string;
                 inputs?: Record<string, any>;
                 category?: string;
+                sourceHash?: string;
             }) => void;
             delete: (id: EARS.EntityId) => void;
         };
@@ -5864,13 +7903,13 @@ declare const services: {
             readonly kanbanItems: () => {
                 content: {
                     workItems: {
-                        id: `Agent-${string}` | `Brain-${string}` | `Message-${string}` | `Thread-${string}` | `Relation-${string}` | `Artifact-${string}` | `Flow-${string}` | `Node-${string}` | `TNode-${string}` | `Prompt-${string}` | `Action-${string}` | `Document-${string}` | `Collection-${string}` | `SearchIndex-${string}` | `IndexedDoc-${string}` | `Terminal-${string}` | `Directory-${string}` | `Settings-${string}` | `FAQ-${string}` | `Secret-${string}` | `Note-${string}`;
+                        id: any;
                         name: string;
                         time: string;
                         date: string;
                         priority: number;
                         tags: never[];
-                        status: {};
+                        status: any;
                         type: "work-item";
                     }[];
                 };
@@ -5881,7 +7920,9 @@ declare const services: {
             readonly connectedData: () => ThreadConnectedData;
         };
         readonly threadCommands: {
-            readonly create: (input: ThreadCreateData) => {
+            readonly create: (input: ThreadCreateData & {
+                id?: string;
+            }) => {
                 id: EARS.EntityId;
                 shortCode: string;
                 timestamp: number;
@@ -5896,10 +7937,17 @@ declare const services: {
                 lastMessageTimestamp?: number;
                 lastVisitedTimestamp?: number;
                 forcedMode?: ThreadEntity["forcedMode"] | null;
+                context?: ThreadEntity["context"];
+                archived?: boolean;
+                chatState?: string;
             }) => void;
             readonly markAsVisited: (id: EARS.EntityId) => void;
             readonly linkFork: (sourceThreadId: EARS.EntityId, forkedThreadId: EARS.EntityId) => void;
             readonly forkCount: (sourceThreadId: EARS.EntityId) => number;
+            readonly setParent: (parentId: EARS.EntityId, childIds: EARS.EntityId[]) => {
+                reparented: string[];
+                skipped: string[];
+            };
             readonly delete: (id: EARS.EntityId) => void;
         };
         readonly noteQueries: {
@@ -5910,6 +7958,7 @@ declare const services: {
             readonly children: (parentId: EARS.EntityId) => NoteDTO[];
             readonly ancestorChain: (noteId: EARS.EntityId) => NoteDTO[];
             readonly referencedBy: (noteId: EARS.EntityId) => EARS.EntityId[];
+            readonly trashedDTOs: () => NoteDTO[];
             readonly expiredSoftDeleted: (maxAgeDays: number) => NoteEntity[];
             readonly connectedData: () => {
                 notes: NoteDTO[];
@@ -5924,6 +7973,7 @@ declare const services: {
                 displayOrder?: number;
                 noteType?: "document" | "tasklist" | "task";
                 completed?: boolean;
+                id?: string;
             }) => NoteEntity;
             readonly update: (id: EARS.EntityId, updates: {
                 title?: string;
@@ -5954,6 +8004,9 @@ declare const services: {
     artifact: typeof artifact;
     brain: typeof brain;
     media: typeof media;
+    cli: CliServiceType;
+    filesystem: FilesystemServiceType;
+    threads: typeof threads;
 };
 
 /**
@@ -5971,4 +8024,4 @@ declare const services: Services;
 declare const params: ActionParams;
 
 export { ActionService, LibraryService, PromptService, params as params, services };
-export type { ActionEntity, ActionParams, Services };
+export type { ActionEntity, ActionParams, Services, SettingsData };

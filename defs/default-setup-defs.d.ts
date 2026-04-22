@@ -125,6 +125,8 @@ interface FlowConfig {
     tracks: Track[];
     /** Mark this flow as the root flow */
     root?: boolean;
+    /** SHA256 hash of the compiled source — populated by the compiler, not authored */
+    sourceHash?: string;
 }
 /** Type guard: distinguish FlowConfig from bare Track[] */
 declare function isFlowConfig(value: Track[] | FlowConfig): value is FlowConfig;
@@ -294,18 +296,23 @@ interface CodeContent {
 type ContentSection = FieldContent | ListContent | MarkdownContent | TextContent | CodeContent;
 
 interface ExportedDocument {
+    id?: string;
     type: 'document';
     name: string;
     content: ContentSection[];
     tags: string[];
+    sourceHash?: string;
 }
 interface ExportedCollection {
+    id?: string;
     type: 'collection';
     name: string;
     description?: string;
     children: ExportedItem[];
+    sourceHash?: string;
 }
 interface ExportedSymlink {
+    id?: string;
     type: 'symlink';
     name: string;
     symlinkPath: string;
@@ -376,6 +383,7 @@ interface ButtonConfig {
 }
 
 interface ExportedNote {
+    id?: string;
     type: 'document' | 'tasklist' | 'task';
     title: string;
     content: string;
@@ -383,6 +391,8 @@ interface ExportedNote {
     completed: boolean;
     hideCompletedChildren: boolean;
     favorite: boolean;
+    displayOrder?: number;
+    savedDisplayOrder?: number;
     children: ExportedNote[];
 }
 interface ExportedNotes {
