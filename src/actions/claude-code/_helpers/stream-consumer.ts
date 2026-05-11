@@ -11,7 +11,7 @@
  * flow actions (async-safe UI/artifact updates):
  * - Consumer: persistClaudeState, setRunning, writer/toolActivity, clearHandle,
  *   dequeueMessage → replayQueuedMessage (dequeue before setRunning to avoid race)
- * - Flow actions: updateSessionArtifact, diff artifact
+ * - Flow actions: updateClaudeState, diff artifact
  *   (triggered via cc.stream.* brain events → on() listeners in the flow)
  *
  * Error boundary: the entire body is wrapped in try/catch. Errors never
@@ -20,14 +20,14 @@
  */
 
 import type { Services, EntityId } from '../../../types';
-import { isPlanFileWrite } from './auto-approve';
+import { isPlanFileWrite, DONT_BYPASS } from './auto-approve';
 import { createStreamWriter } from './stream-writer';
 import { createToolActivityWriter } from './tool-activity-writer';
+import { createThinkingWriter } from './thinking-writer';
 import { createPlanDraft } from './plan-artifact';
 import { parseExitPlanModeInput, buildPlanApprovalContext } from './plan-approval';
 import { parseAskUserQuestionInput } from './ask-user-question';
-import { getClaudeState, persistClaudeState, setRunning, dequeueMessage, clearSessionId } from './thread-context';
-import { updateSessionArtifact, updateChatState, readSessionPermissionMode, extractStaleSessionId, markSessionBroken } from './session-artifact';
+import { getClaudeState, persistClaudeState, setRunning, dequeueMessage, updateClaudeState, updateChatState, extractStaleSessionId, markSessionBroken } from './thread-context';
 import { parseContextMarkdown } from './context-parser';
 
 /** Tools whose execution mutates files and should roll up into a diff artifact. */
@@ -68,6 +68,7 @@ export interface ConsumerContext {
 export interface ConsumerWriters {
   writer: ReturnType<typeof createStreamWriter>;
   toolActivity: ReturnType<typeof createToolActivityWriter>;
+  thinking: ReturnType<typeof createThinkingWriter>;
   messageId: EntityId;
 }
 
@@ -95,6 +96,10 @@ export async function consumeStream(
   let currentMessageId: EntityId = initialWriters.messageId;
   let writer = initialWriters.writer;
   let toolActivity = initialWriters.toolActivity;
+  let thinking = initialWriters.thinking;
+
+  /** Idempotent — safe to call from every finalization path. */
+  const finaliseThinking = () => { if (thinking.isStreaming) thinking.finalise(); };
 
   // Set by the control_request handler after a user-interactive flow.
   // The next `message_start` will split into a new message.
@@ -112,24 +117,22 @@ export async function consumeStream(
   // rejects (error subtypes like error_during_execution).
   let resultFromLine: { sessionId: string; text: string; totalCostUsd: number; durationMs: number; subtype?: string; errors?: string[] } | undefined;
 
-  // After the main turn completes, we send `/context` through the existing
-  // handle to get context window usage without spawning a new subprocess.
-  let contextQueryPending = false;
-  let contextUsageParsed: any;
-
   /** Finalize the current message and create a new "Thinking…" placeholder. */
   function splitMessage() {
     writer.finalize(writer.text);
+    finaliseThinking();
     services.chat.updateMessageState(currentMessageId as any, { forkable: true } as any);
     const segmentHadErrors = toolActivity.entries.some(e => e.status === 'error');
     toolActivity.finalise(segmentHadErrors ? 'error' : 'done');
 
     const msg = services.chat.sendBlockMessage({ threadId, text: 'Thinking…', blocks: [], forkable: false });
     log.debug('message split', { previousId: currentMessageId, nextId: msg.messageId });
+    const newThinking = createThinkingWriter(services, msg.messageId as EntityId, { intervalMs: 250 });
     return {
       currentMessageId: msg.messageId as EntityId,
       writer: createStreamWriter(services, msg.messageId as EntityId, { intervalMs: 80 }),
-      toolActivity: createToolActivityWriter(services, msg.messageId as EntityId, { intervalMs: 250, phase }),
+      toolActivity: createToolActivityWriter(services, msg.messageId as EntityId, { intervalMs: 250, phase, getThinkingBlock: () => newThinking.buildBlock() }),
+      thinking: newThinking,
     };
   }
 
@@ -140,13 +143,8 @@ export async function consumeStream(
       const line = ev as any;
       eventCount++;
 
-      // While waiting for the /context result, skip all normal event handlers.
-      // No timeout needed: /context is a local-jsx command (synchronous), and
-      // the loop terminates naturally when the child exits (eventQueue.close).
-      if (contextQueryPending && line.type !== 'result') continue;
-
       if (eventCount <= 5 || eventCount % 20 === 0) {
-        log.debug('stream event', { n: eventCount, type: line?.type });
+        log.debug('stream event', { n: eventCount, type: line?.type, line });
       }
 
       // Split into a new message after approval/question answer — but only
@@ -156,7 +154,7 @@ export async function consumeStream(
       const isMessageStart = line.type === 'assistant' || (line.type === 'stream_event' && (line as any).event?.type === 'message_start');
       if (splitOnNextMessageStart && isMessageStart) {
         splitOnNextMessageStart = false;
-        ({ currentMessageId, writer, toolActivity } = splitMessage());
+        ({ currentMessageId, writer, toolActivity, thinking } = splitMessage());
       }
 
       // First `system/init` event carries sessionId/model/cwd.
@@ -168,6 +166,7 @@ export async function consumeStream(
           persistClaudeState(services, threadId, {
             sessionId: line.session_id,
             lastTurnAt: Date.now(),
+            cwd: line.cwd || undefined,
           });
         }
         services.emitter.sendToBrainSystem({
@@ -187,18 +186,29 @@ export async function consumeStream(
 
         // New text content block starting after prior text → inject separator
         // so successive assistant segments don't concatenate without whitespace.
-        // Use a space after sentence-ending punctuation; paragraph break otherwise
-        // (e.g. lists, code blocks, headings).
         if (evt?.type === 'content_block_start' && evt?.content_block?.type === 'text') {
           if (writer.text) {
-            const lastChar = writer.text[writer.text.length - 1];
-            writer.push(lastChar === '.' ? ' ' : '\n\n');
+            writer.push('\n');
           }
         }
 
         // Anthropic text deltas.
         const delta = evt?.delta;
+
+        // Extended thinking deltas — accumulate into the thinking writer.
+        if (delta?.type === 'thinking_delta' && typeof delta.thinking === 'string') {
+          // Clear the "Thinking…" placeholder text on the first thinking delta
+          // so only the thinking block is visible, not redundant text below it.
+          if (!thinking.hasContent) {
+            services.chat.updateMessageState(currentMessageId as any, { text: '' });
+          }
+          thinking.push(delta.thinking);
+          continue;
+        }
+
         if (delta?.type === 'text_delta' && typeof delta.text === 'string') {
+          // Finalize thinking when the first text delta arrives.
+          finaliseThinking();
           writer.push(delta.text);
           continue;
         }
@@ -216,6 +226,9 @@ export async function consumeStream(
           if (block?.type === 'tool_use') {
             if (block.name === 'ExitPlanMode') continue;
 
+            // Finalize thinking and hand blocks ownership to tool-activity.
+            finaliseThinking();
+            thinking.stopDirectWrites();
             writer.flush();
             const summary = block.input ? shortenInput(block.input) : '';
             toolActivity.append({
@@ -232,8 +245,8 @@ export async function consumeStream(
                 mutatedPaths.push(p);
               }
             }
-            // Update the session artifact's recent-tools list (last 3).
-            updateSessionArtifact(services, threadId, (prev) => {
+            // Update the thread's recent-tools list (last 3).
+            updateClaudeState(services, threadId, (prev) => {
               const recent = (prev.recentTools ?? []).slice(-2);
               recent.push({ name: block.name, summary, at: Date.now() });
               return { recentTools: recent };
@@ -306,7 +319,7 @@ export async function consumeStream(
           toolActivity.update(toolUseId, {
             status: isError ? 'error' : 'ok',
             outputSummary: outputSummary || undefined,
-            ...(isError ? { details: { error: displayText } } : {}),
+            details: isError ? { error: displayText } : { output: displayText },
           });
 
           if (isError) {
@@ -338,25 +351,23 @@ export async function consumeStream(
           continue;
         }
 
+        // Read permission state once for all auto-approve checks below.
+        const ccState = getClaudeState(services, threadId as string);
+        const permMode = ccState?.permissionMode ?? 'acceptEdits';
+
         // Auto-approve tool requests when bypass mode is active (mid-turn aware).
         // Exclude interaction-point tools that aren't permission prompts.
-        const DONT_BYPASS = new Set(['ExitPlanMode', 'AskUserQuestion']);
-        if (req.subtype === 'can_use_tool' && !DONT_BYPASS.has(req.tool_name)) {
-          const artifactMode = readSessionPermissionMode(services, threadId);
-          if (artifactMode === 'bypassPermissions') {
-            log.debug('bypass: auto-approved tool', { tool: req.tool_name });
-            handle.respond(requestId, { behavior: 'allow', updatedInput: req.input });
-            continue;
-          }
+        if (req.subtype === 'can_use_tool' && !DONT_BYPASS.has(req.tool_name) && permMode === 'bypassPermissions') {
+          log.debug('bypass: auto-approved tool', { tool: req.tool_name });
+          handle.respond(requestId, { behavior: 'allow', updatedInput: req.input });
+          continue;
         }
 
-        // Auto-approve file edits when the artifact's permission mode is
-        // 'acceptEdits' (the "Auto" toggle) OR the user opted in mid-turn.
+        // Auto-approve file edits when permission mode is 'acceptEdits'
+        // (the "Auto" toggle) OR the user opted in mid-turn.
         if (req.subtype === 'can_use_tool' && FILE_MUTATION_TOOLS.has(req.tool_name)) {
-          const ccState = getClaudeState(services, threadId);
-          const artifactMode = readSessionPermissionMode(services, threadId);
-          if (ccState?.autoAcceptEdits || artifactMode === 'acceptEdits') {
-            log.debug('auto-approved file edit', { tool: req.tool_name, source: ccState?.autoAcceptEdits ? 'mid-turn' : 'artifact' });
+          if (ccState?.autoAcceptEdits || permMode === 'acceptEdits') {
+            log.debug('auto-approved file edit', { tool: req.tool_name, source: ccState?.autoAcceptEdits ? 'mid-turn' : 'setting' });
             handle.respond(requestId, { behavior: 'allow', updatedInput: req.input });
             continue;
           }
@@ -364,6 +375,7 @@ export async function consumeStream(
 
         // Freeze the tool-activity block so it stops showing "Working…".
         writer.flush();
+        finaliseThinking();
         toolActivity.finalise('done');
 
         // Send the appropriate interactive block.
@@ -494,13 +506,6 @@ export async function consumeStream(
       // The `result` event is the CLI's terminal signal. Extract cost/duration
       // directly — handle.result may reject for error subtypes, losing this data.
       if (line.type === 'result') {
-        // Second result: /context response — parse and break
-        if (contextQueryPending) {
-          contextUsageParsed = parseContextMarkdown((line as any).result ?? '');
-          break;
-        }
-
-        // First result: main turn completed
         log.debug('result line received', {
           subtype: (line as any).subtype,
           total_cost_usd: (line as any).total_cost_usd,
@@ -518,15 +523,6 @@ export async function consumeStream(
           subtype: (line as any).subtype,
           errors: (line as any).errors,
         };
-
-        // Only query /context on successful turns — error results mean the
-        // CLI may be exiting or in a bad state.
-        const isSuccess = (line as any).subtype == null || (line as any).subtype === 'success';
-        if (isSuccess) {
-          contextQueryPending = true;
-          try { handle.send('/context'); } catch { break; }
-          continue;
-        }
         break;
       }
     }
@@ -577,16 +573,9 @@ export async function consumeStream(
         forkCliUuid: ctx.forkCliUuid ?? null,
       });
 
-      // Detect stale session and clear it so the next turn starts fresh.
-      const staleId = extractStaleSessionId(errorText);
-      if (staleId) {
-        writer.finalize('⚠️ Session expired — the conversation file was deleted or is invalid. Your next message will start a fresh session.');
-      } else {
-        writer.finalize(`⚠️ ${errorText}`);
-      }
-      clearSessionId(services, threadId);
-      markSessionBroken(services, threadId, staleId ? `Session ${staleId} not found` : errorText);
+      finalizeSessionError(services, threadId, writer, errorText);
 
+      finaliseThinking();
       toolActivity.finalise('error');
       services.chat.updateMessageState(currentMessageId as any, { forkable: true } as any);
     } else {
@@ -599,6 +588,7 @@ export async function consumeStream(
       }
 
       // Finalize writers (needs closure references).
+      finaliseThinking();
       toolActivity.finalise(hadToolErrors ? 'error' : 'done');
       // If the stream produced text (either via streamed deltas into `writer`
       // or a terminal `result.result` string), finalize with it. Otherwise
@@ -642,7 +632,7 @@ export async function consumeStream(
     if (queued) await replayQueuedMessage(services, threadId, queued, log);
 
     // Emit to flow → CC: Turn Completed action handles:
-    //   updateSessionArtifact, diff artifact
+    //   updateClaudeState, diff artifact
     services.emitter.sendToBrainSystem({
       eventType: 'cc.stream.completed',
       payload: {
@@ -655,18 +645,45 @@ export async function consumeStream(
         mutatedPaths,
         hadErrors: !!hadToolErrors || !!isErrorResult,
         userText: text,
-        contextUsage: contextUsageParsed,
       },
     });
 
+    // Fire-and-forget: query /context in the background AFTER all turn
+    // cleanup (clearHandle, setRunning, queued replay, cc.stream.completed)
+    // so a concurrent new turn doesn't race with this process for the
+    // same session JSONL.
+    if (!isErrorResult && result.sessionId) {
+      queryContextInBackground(services, threadId, result.sessionId, ctx.sessionCwd, log);
+    }
+
   } catch (err: any) {
     const message = err?.message || 'Claude Code request failed';
+
+    // If the handle has been cleared by another operation (revert,
+    // summarize, or a new turn replacing this one), this consumer is
+    // superseded. The superseding operation already handled state cleanup
+    // and the placeholder message may have been soft-deleted — touching
+    // any shared state or emitting events could corrupt the session.
+    if (!stillCurrent()) {
+      log.debug('stream consumer superseded — finalizing message, skipping thread cleanup');
+      // Finalize the message so "Thinking…" doesn't persist if not soft-deleted.
+      // Thread-scoped state (handle, isRunning, cc.stream.completed) is left to
+      // whoever superseded this consumer.
+      finaliseThinking();
+      toolActivity.finalise('done');
+      services.chat.updateMessageState(currentMessageId as any, {
+        responseTimestamp: Date.now(),
+        forkable: true,
+      } as any);
+      return;
+    }
 
     // If pause-turn already ran (isRunning=false), the kill was intentional.
     // Finalize writers cleanly and skip cleanup — pause-turn handled it.
     const state = getClaudeState(services, threadId);
     if (!state?.isRunning) {
       log.debug('stream consumer exiting — turn was paused');
+      finaliseThinking();
       const segmentHadErrors = toolActivity.entries.some(e => e.status === 'error');
       toolActivity.finalise(segmentHadErrors ? 'error' : 'done');
       if (writer.text) {
@@ -681,7 +698,7 @@ export async function consumeStream(
         } as any);
       }
 
-      // Emit cc.stream.completed so Turn Completed updates the session artifact
+      // Emit cc.stream.completed so Turn Completed updates the thread context
       // (turn count, tool call count, cost). Cost is best-effort: resultFromLine
       // is only set if the CLI's terminal `result` event arrived before the kill
       // signal took effect — typically it hasn't, so cost will be 0.
@@ -705,28 +722,15 @@ export async function consumeStream(
 
     // Real error — not a user-initiated pause.
     log.error('stream consumer failed', { message, stack: err?.stack });
+    finaliseThinking();
     toolActivity.finalise('error');
 
-    // Session-not-found mid-stream: clear stale session and mark artifact.
-    const staleId = extractStaleSessionId(message);
-    if (staleId) {
-      writer.finalize(`${writer.text}\n\n⚠️ Session expired — the conversation file was deleted or is invalid. Your next message will start a fresh session.`.trim());
-      clearSessionId(services, threadId);
-      markSessionBroken(services, threadId, `Session ${staleId} not found`);
-    } else {
-      writer.finalize(`${writer.text}\n\n⚠️ ${message}`.trim());
-    }
+    // Session-not-found mid-stream: clear stale session and mark broken.
+    finalizeSessionError(services, threadId, writer, message, writer.text);
     services.chat.updateMessageState(currentMessageId as any, { forkable: true } as any);
 
     // Kill the CLI process on error (it may be in a bad state).
     try { handle.kill(); } catch { /* already gone */ }
-
-    // Superseded: the error likely came from killTurn()'s SIGTERM and the
-    // new turn already owns the thread slot. Skip shared cleanup & emit.
-    if (!stillCurrent()) {
-      log.debug('stream consumer superseded on error path — skipping thread cleanup & emit');
-      return;
-    }
 
     // Critical cleanup — dequeue before setRunning(false) to avoid race.
     (services.cli as any).claudeCode.clearHandle(threadId);
@@ -744,6 +748,26 @@ export async function consumeStream(
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
+
+/**
+ * Finalize a session error: detect stale sessions, display warning, and mark
+ * the session broken. Shared by the success-path error-result handler and the
+ * catch-path error handler.
+ */
+export function finalizeSessionError(
+  services: Services,
+  threadId: EntityId,
+  writer: ReturnType<typeof createStreamWriter>,
+  errorText: string,
+  prefix?: string,
+): void {
+  const staleId = extractStaleSessionId(errorText);
+  const warning = staleId
+    ? '⚠️ Session expired — the conversation file was deleted or is invalid. Your next message will start a fresh session in the same project directory. Previous messages are still visible for reference.'
+    : `⚠️ ${errorText}`;
+  writer.finalize(prefix ? `${prefix}\n\n${warning}`.trim() : warning);
+  markSessionBroken(services, threadId, staleId ? `Session ${staleId} not found` : errorText);
+}
 
 /**
  * Replay a previously-dequeued message by re-invoking the chat action.
@@ -790,12 +814,12 @@ async function replayQueuedMessage(
   }
 }
 
-/** Shorten tool inputs for the inline tool-use note. */
+/** Extract primary field from tool input for the inline tool-use note. */
 function shortenInput(input: Record<string, unknown>): string {
   const keys = Object.keys(input);
   if (keys.length === 0) return '';
   const primary = (input as any).path || (input as any).file_path || (input as any).command || (input as any).pattern;
-  if (typeof primary === 'string') return primary.length > 60 ? primary.slice(0, 57) + '…' : primary;
+  if (typeof primary === 'string') return primary;
   return keys.slice(0, 3).join(', ');
 }
 
@@ -820,4 +844,71 @@ function extractToolResultText(content: unknown): string {
 function stripToolUseErrorEnvelope(raw: string): string {
   const m = raw.match(/^\s*<tool_use_error>([\s\S]*?)<\/tool_use_error>\s*$/);
   return m ? m[1].trim() : raw.trim();
+}
+
+// ─── Background /context query ──────────────────────────────────────────────
+
+const CONTEXT_THRESHOLDS = [25, 50, 75, 90];
+
+/**
+ * Query /context in a separate non-persisted CLI process and update the
+ * thread context directly when done. Fire-and-forget — never blocks
+ * the turn completion flow.
+ */
+function queryContextInBackground(
+  services: Services,
+  threadId: EntityId,
+  sessionId: string,
+  sessionCwd: string | undefined,
+  log: any,
+): void {
+  (async () => {
+    const ctxHandle = await services.cli.claudeCode.query({
+      ...(sessionCwd && { cwd: sessionCwd }),
+      prompt: '/context',
+      resume: sessionId,
+      maxTurns: 1,
+      permissionMode: 'plan',
+      noSessionPersistence: true,
+    });
+    const ctxResult = await ctxHandle.result;
+    const contextUsage = parseContextMarkdown(ctxResult.text || '');
+    if (!contextUsage) return;
+
+    // Check which thresholds are newly crossed.
+    const prev = getClaudeState(services, threadId as string);
+    const alerted: number[] = prev?.alertedThresholds ?? [];
+    const pct = contextUsage.percentage;
+    const newAlerts = CONTEXT_THRESHOLDS.filter(t => pct >= t && !alerted.includes(t));
+
+    updateClaudeState(services, threadId, (prevContent) => ({
+      contextUsage,
+      ...(newAlerts.length > 0
+        ? { alertedThresholds: [...(prevContent.alertedThresholds ?? []), ...newAlerts] }
+        : {}),
+    }));
+
+    if (newAlerts.length > 0) {
+      const highest = Math.max(...newAlerts);
+      const variant = highest >= 90 ? 'error' : highest >= 75 ? 'warning' : 'info';
+      const label = highest >= 90 ? 'Context Critical' : 'Context Usage';
+      let message = `Context window is ${contextUsage.percentage}% full (${fmtTokens(contextUsage.totalTokens)} / ${fmtTokens(contextUsage.maxTokens)} tokens).`;
+      if (highest >= 90) message += ' Consider starting a new session soon.';
+
+      services.chat.sendBlockMessage({
+        threadId: threadId as any,
+        text: message,
+        blocks: [{ type: 'note', props: { content: message, variant, label } }],
+        forkable: false,
+      });
+    }
+  })().catch(err => {
+    log.debug('/context background query failed (non-critical)', { message: err?.message });
+  });
+}
+
+function fmtTokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+  return String(n);
 }

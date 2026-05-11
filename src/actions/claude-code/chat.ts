@@ -17,9 +17,9 @@
 import type { ActionMeta, Services, Z, EntityId } from '../../types';
 import { createStreamWriter } from './_helpers/stream-writer';
 import { createToolActivityWriter } from './_helpers/tool-activity-writer';
-import { ensureSessionArtifact, updateSessionArtifact, updateChatState, readSessionPermissionMode, readWorktreeMode, extractStaleSessionId, markSessionBroken, readSessionCwd } from './_helpers/session-artifact';
-import { getClaudeState, persistClaudeState, setRunning, enqueueMessage, killTurn, clearSessionId } from './_helpers/thread-context';
-import { consumeStream } from './_helpers/stream-consumer';
+import { createThinkingWriter } from './_helpers/thinking-writer';
+import { getClaudeState, persistClaudeState, setRunning, enqueueMessage, killTurn, ensureSessionMarker, updateChatState, extractStaleSessionId } from './_helpers/thread-context';
+import { consumeStream, finalizeSessionError } from './_helpers/stream-consumer';
 
 export const meta: ActionMeta = {
   label: 'Claude Code Chat',
@@ -105,7 +105,7 @@ export async function action(
 
   // Resume any prior conversation parked on this thread.
   const prior = getClaudeState(services, threadId);
-  const resumeSessionId = prior?.sessionId;
+  const resumeSessionId = prior?.sessionId || undefined;
   let forkFrom = prior?.forkFrom;
   let revertTo = prior?.revertTo;
 
@@ -124,6 +124,17 @@ export async function action(
     persistClaudeState(services, threadId, {
       revertTo: undefined,
       forkFrom: undefined,
+    });
+    // Notify the user — their revert/fork intent was silently dropped.
+    services.chat.sendBlockMessage({
+      threadId,
+      text: '⚠️ Could not revert — session data is unavailable. Starting a fresh session.',
+      blocks: [{ type: 'note', props: {
+        content: 'The revert point could not be found because the session was lost. Your next message will start a new conversation.',
+        variant: 'warning',
+        label: 'Revert Skipped',
+      }}],
+      forkable: false,
     });
     forkFrom = undefined;
     revertTo = undefined;
@@ -178,9 +189,12 @@ export async function action(
 
   // ─── CWD check — prompt for directory if none configured ────────────
   // Runs before the placeholder message so the empty bubble never appears.
+  const cwdOverride = params.cwdOverride as string | undefined;
+  const forceDirectoryPicker = params.forceDirectoryPicker as boolean | undefined;
+
   const codeSettings = services.repository.settingsQueries.getPluginSettings('code') as any;
-  const hasCwd = codeSettings?.defaultBaseDirectory || codeSettings?.lastDirectoryOpened;
-  if (!hasCwd) {
+  const hasCwd = codeSettings?.defaultBaseDirectory || codeSettings?.lastDirectoryOpened || prior?.cwd;
+  if (forceDirectoryPicker || (!hasCwd && !cwdOverride)) {
     const projects = (services.repository.settingsQueries.getGeneralSettings('projects') as any[]) || [];
     const blocks: any[] = [
       { type: 'prompt', props: { content: 'Select a project directory' } },
@@ -234,22 +248,18 @@ export async function action(
   log.debug('placeholder message created', { messageId: currentMessageId });
 
   const writer = createStreamWriter(services, currentMessageId, { intervalMs: 80 });
-  const toolActivity = createToolActivityWriter(services, currentMessageId, { intervalMs: 250, phase });
+  const thinking = createThinkingWriter(services, currentMessageId, { intervalMs: 250 });
+  const toolActivity = createToolActivityWriter(services, currentMessageId, { intervalMs: 250, phase, getThinkingBlock: () => thinking.buildBlock() });
 
-  // Upsert the thread's claude-session artifact.
-  ensureSessionArtifact(services, threadId, {
-    chatState: 'working',
-    startedAt: Date.now(),
-  });
-  // Clear any prior session error (ensureSessionArtifact only applies
-  // initial content on creation, not on existing artifacts).
-  updateSessionArtifact(services, threadId, { sessionError: undefined });
+  // Upsert the thread's claude-session artifact (type marker only).
+  ensureSessionMarker(services, threadId);
+  persistClaudeState(services, threadId, { startedAt: prior?.startedAt ?? Date.now(), sessionError: undefined });
   updateChatState(services, threadId, 'working');
 
   // Read the user's current permission-mode and worktree choices.
-  const activePermissionMode = readSessionPermissionMode(services, threadId);
+  const activePermissionMode = prior?.permissionMode ?? 'acceptEdits';
   const effectivePermissionMode = phase === 'plan' ? 'plan' : activePermissionMode;
-  const useWorktree = readWorktreeMode(services, threadId);
+  const useWorktree = prior?.useWorktree ?? false;
   log.debug('active settings', { permissionMode: effectivePermissionMode, worktree: useWorktree });
 
   // Phase-aware system-prompt nudging (plan/edit/review).
@@ -299,11 +309,22 @@ export async function action(
     });
     // When resuming, use the CWD where the session was originally created so
     // the CLI can locate the session JSONL in the correct project bucket.
-    sessionCwd = resumeSessionId ? readSessionCwd(services, threadId) : undefined;
+    // For new sessions, use cwdOverride if provided (from "new thread in project" menu).
+    sessionCwd = resumeSessionId ? prior?.cwd : (cwdOverride || undefined);
+
+    // Fallback: if resuming but prior.cwd is missing, try project settings
+    // so the CLI doesn't fall back to process.cwd() (wrong directory).
     if (resumeSessionId && !sessionCwd) {
-      log.warn('[resume] sessionId exists but sessionCwd is missing — CLI will use process.cwd()', {
-        threadId, resumeSessionId, revertTo: revertTo?.cliUuid ?? null,
+      sessionCwd = codeSettings?.defaultBaseDirectory || codeSettings?.lastDirectoryOpened || undefined;
+      log.warn('[resume] sessionId exists but sessionCwd is missing — falling back to project settings', {
+        threadId, resumeSessionId, revertTo: revertTo?.cliUuid ?? null, fallbackCwd: sessionCwd ?? 'NONE',
       });
+    }
+
+    // Eager persist: store CWD before the query fires so it survives if
+    // the turn is killed before the CLI's system/init event arrives.
+    if (sessionCwd && !prior?.cwd) {
+      persistClaudeState(services, threadId, { cwd: sessionCwd });
     }
 
     const handle = await services.cli.claudeCode.query({
@@ -344,7 +365,7 @@ export async function action(
       revertCliUuid: revertTo?.cliUuid,
       forkCliUuid: forkFrom?.cliUuid,
     }, {
-      writer, toolActivity, messageId: currentMessageId as EntityId,
+      writer, toolActivity, thinking, messageId: currentMessageId as EntityId,
     }).catch((err) => {
       // Safety net — consumeStream has its own try/catch, but guard
       // against truly unexpected escapes. Mirror its cleanup path.
@@ -364,26 +385,13 @@ export async function action(
     toolActivity.finalise('error');
     setRunning(services, threadId, false);
 
-    // ─── Session-not-found: clear stale sessionId, mark artifact broken ──
-    const staleId = extractStaleSessionId(message);
-    if (staleId) {
-      log.error('[session-expired] stale session detected', {
-        threadId,
-        staleId,
-        resumeSessionId: resumeSessionId ?? null,
-        sessionCwd: sessionCwd ?? null,
-        hadRevertTo: !!revertTo,
-        hadForkFrom: !!forkFrom,
-        cliError: message,
-      });
-      const userMessage = 'Session expired — the conversation file was deleted or is invalid. Your next message will start a fresh session.';
-      writer.finalize(`⚠️ ${userMessage}`);
-      clearSessionId(services, threadId);
-      markSessionBroken(services, threadId, `Session ${staleId} not found`);
-      return { success: false, error: userMessage, messageId: currentMessageId };
+    // ─── Session-not-found: clear stale sessionId, mark session broken ──
+    if (extractStaleSessionId(message)) {
+      finalizeSessionError(services, threadId as EntityId, writer, message);
+      return { success: false, error: message, messageId: currentMessageId };
     }
 
-    // ─── Generic error (existing behavior) ───────────────────────────────
+    // ─── Generic error ───────────────────────────────────────────────────
     updateChatState(services, threadId, 'idle');
     services.emitter.sendToPlugin('threads', {
       type: 'FLASH_CHAT_STATE', threadId, stateId: 'error', durationMs: 3000,

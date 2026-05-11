@@ -1,5 +1,5 @@
 import type { ActionMeta, EntityId, Services } from '../../../types';
-import { getOnboardingState, persistOnboardingState, finishOnboarding, flashSuccess } from '../onboarding-helpers';
+import { getOnboardingState, persistOnboardingState, finishOnboarding, flashState } from '../onboarding-helpers';
 
 export const meta: ActionMeta = {
   label: 'Handle CC Import Threads Step',
@@ -20,12 +20,11 @@ export async function action(
   const state = getOnboardingState(services, threadId);
   if (!state) return { success: false, reason: 'no-state' };
 
+  flashState(services, threadId);
+
   if (response === 'yes') {
     services.threads.updateChatState(threadId, 'working');
     await importSessions(services);
-    flashSuccess(services, threadId, 'paused');
-  } else {
-    flashSuccess(services, threadId, 'paused');
   }
 
   // Show recent imported threads to continue, or finish
@@ -40,19 +39,17 @@ export async function action(
     .slice(0, 7);
 
   if (recentThreads.length > 0) {
-    const choices = [
-      ...recentThreads.map((t: any) => ({
-        id: t.id,
-        label: t.topic || 'Untitled',
-      })),
-      { id: 'skip', label: 'Skip', description: "Start fresh" },
-    ];
+    const choices = recentThreads.map((t: any) => ({
+      id: t.id,
+      label: t.topic || 'Untitled',
+    }));
 
     const { messageId } = services.chat.sendChoiceBlock({
       threadId,
       text: "Here are your most recent threads. Want to continue where you left off?",
       prompt: 'Pick a thread to continue',
       choices,
+      skipOption: { id: 'skip', label: 'Skip' },
       allowCustom: false,
       compact: true,
       forkable: false,
@@ -156,7 +153,7 @@ async function importSessions(services: Services) {
 
         const thread = services.repository.threadQueries.byId(newThreadId) as any;
         services.repository.threadCommands.update(newThreadId, {
-          context: { ...(thread?.context || {}), claudeCode: { sessionId: session.id } },
+          context: { ...(thread?.context || {}), claudeCode: { sessionId: session.id, cwd: cwd || undefined } },
           tags: [...(thread?.tags || ['imported']), 'claude-code'],
         });
 

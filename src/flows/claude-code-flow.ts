@@ -35,6 +35,8 @@ export default {
                   phase: "$.event.data.payload.phase",
                   messageId: "$.event.data.payload.messageId",
                   references: "$.event.data.payload.references",
+                  cwdOverride: "$.event.data.payload.cwdOverride",
+                  forceDirectoryPicker: "$.event.data.payload.forceDirectoryPicker",
                 },
               }),
             ],
@@ -191,6 +193,47 @@ export default {
       ]],
       "Turn paused by user",
     ),
+    // ─── User-initiated unqueue ──────────────────────────────────────
+    on(
+      "user.thread.unqueue",
+      [[
+        action("CC: Unqueue Message", {
+          label: "unqueue-message",
+          map: {
+            threadId: "$.event.data.payload.threadId",
+            messageId: "$.event.data.payload.messageId",
+          },
+        }),
+      ]],
+      "Queued message cancelled by user",
+    ),
+    // ─── User setting toggles ───────────────────────────────────────
+    on(
+      "user.update.permissionMode",
+      [[
+        action("CC: Update Permission Mode", {
+          label: "update-permission-mode",
+          map: {
+            threadId: "$.event.data.payload.threadId",
+            mode: "$.event.data.payload.mode",
+          },
+        }),
+      ]],
+      "Permission mode updated",
+    ),
+    on(
+      "user.update.worktree",
+      [[
+        action("CC: Update Worktree", {
+          label: "update-worktree",
+          map: {
+            threadId: "$.event.data.payload.threadId",
+            useWorktree: "$.event.data.payload.useWorktree",
+          },
+        }),
+      ]],
+      "Worktree toggle updated",
+    ),
     // ─── Thread lifecycle ────────────────────────────────────────────
     // Clean up Claude Code state when threads are reverted or forked.
     // Unified revert-family route — the `kind` discriminator routes to
@@ -199,6 +242,15 @@ export default {
     on(
       "thread.revert",
       [[
+        // Stop the active turn first so the stream consumer exits cleanly
+        // before any revert/rewind/summarize handler mutates session state.
+        // Sequential within this track — pause completes before the branch.
+        action("CC: Pause Turn", {
+          label: "pause-before-revert",
+          map: {
+            threadId: "$.event.data.payload.threadId",
+          },
+        }),
         branch([
           {
             if: "$.event.data.payload.kind == 'revert'",
@@ -248,22 +300,30 @@ export default {
     on(
       "user.command",
       [[
+        // Gate: only process cc-* prefixed commands in this flow
         branch([
-          // Session operations (resume, import) — share transcript import helpers
-          { if: "$.event.data.payload.command == 'cc-resume'", steps: [action("CC: Session Ops", { label: "cc-resume", map: { command: "$.event.data.payload.command", text: "$.event.data.payload.text", threadId: "$.event.data.payload.threadId", references: "$.event.data.payload.references" } })] },
-          { if: "$.event.data.payload.command == 'cc-import'", steps: [action("CC: Session Ops", { label: "cc-import", map: { command: "$.event.data.payload.command", text: "$.event.data.payload.text", threadId: "$.event.data.payload.threadId", references: "$.event.data.payload.references" } })] },
-          // Standalone commands
-          { if: "$.event.data.payload.command == 'cc-compact'", steps: [action("CC: Compact", { label: "cc-compact", map: { command: "$.event.data.payload.command", text: "$.event.data.payload.text", threadId: "$.event.data.payload.threadId", references: "$.event.data.payload.references" } })] },
-          { if: "$.event.data.payload.command == 'cc-fork'", steps: [action("CC: Fork", { label: "cc-fork", map: { command: "$.event.data.payload.command", text: "$.event.data.payload.text", threadId: "$.event.data.payload.threadId", references: "$.event.data.payload.references" } })] },
-          { if: "$.event.data.payload.command == 'cc-context'", steps: [action("CC: Context", { label: "cc-context", map: { command: "$.event.data.payload.command", text: "$.event.data.payload.text", threadId: "$.event.data.payload.threadId", references: "$.event.data.payload.references" } })] },
-          { if: "$.event.data.payload.command == 'cc-recap'", steps: [action("CC: Recap", { label: "cc-recap", map: { command: "$.event.data.payload.command", text: "$.event.data.payload.text", threadId: "$.event.data.payload.threadId" } })] },
-          // Directory operations (add-dir, set-dir) — share path helpers
-          { if: "$.event.data.payload.command == 'cc-add-dir'", steps: [action("CC: Dir Ops", { label: "cc-add-dir", map: { command: "$.event.data.payload.command", text: "$.event.data.payload.text", threadId: "$.event.data.payload.threadId", references: "$.event.data.payload.references" } })] },
-          { if: "$.event.data.payload.command == 'cc-set-dir'", steps: [action("CC: Dir Ops", { label: "cc-set-dir", map: { command: "$.event.data.payload.command", text: "$.event.data.payload.text", threadId: "$.event.data.payload.threadId", references: "$.event.data.payload.references" } })] },
-        ], [
-          // Else: info/config commands + passthrough (sessions, config, model, etc.)
-          action("CC: Run Command", { label: "cc-command", map: { command: "$.event.data.payload.command", text: "$.event.data.payload.text", threadId: "$.event.data.payload.threadId", references: "$.event.data.payload.references" } }),
-        ], "CC Command Router"),
+          {
+            if: "$.event.data.payload.command starts_with 'cc-'",
+            steps: [
+              branch([
+                // Session operations (resume, import) — share transcript import helpers
+                { if: "$.event.data.payload.command == 'cc-resume'", steps: [action("CC: Session Ops", { label: "cc-resume", map: { command: "$.event.data.payload.command", text: "$.event.data.payload.text", threadId: "$.event.data.payload.threadId", references: "$.event.data.payload.references" } })] },
+                { if: "$.event.data.payload.command == 'cc-import'", steps: [action("CC: Session Ops", { label: "cc-import", map: { command: "$.event.data.payload.command", text: "$.event.data.payload.text", threadId: "$.event.data.payload.threadId", references: "$.event.data.payload.references" } })] },
+                // Standalone commands
+                { if: "$.event.data.payload.command == 'cc-compact'", steps: [action("CC: Compact", { label: "cc-compact", map: { command: "$.event.data.payload.command", text: "$.event.data.payload.text", threadId: "$.event.data.payload.threadId", references: "$.event.data.payload.references" } })] },
+                { if: "$.event.data.payload.command == 'cc-fork'", steps: [action("CC: Fork", { label: "cc-fork", map: { command: "$.event.data.payload.command", text: "$.event.data.payload.text", threadId: "$.event.data.payload.threadId", references: "$.event.data.payload.references" } })] },
+                { if: "$.event.data.payload.command == 'cc-context'", steps: [action("CC: Context", { label: "cc-context", map: { command: "$.event.data.payload.command", text: "$.event.data.payload.text", threadId: "$.event.data.payload.threadId", references: "$.event.data.payload.references" } })] },
+                { if: "$.event.data.payload.command == 'cc-recap'", steps: [action("CC: Recap", { label: "cc-recap", map: { command: "$.event.data.payload.command", text: "$.event.data.payload.text", threadId: "$.event.data.payload.threadId" } })] },
+                // Directory operations (add-dir, set-dir) — share path helpers
+                { if: "$.event.data.payload.command == 'cc-add-dir'", steps: [action("CC: Dir Ops", { label: "cc-add-dir", map: { command: "$.event.data.payload.command", text: "$.event.data.payload.text", threadId: "$.event.data.payload.threadId", references: "$.event.data.payload.references" } })] },
+                { if: "$.event.data.payload.command == 'cc-set-dir'", steps: [action("CC: Dir Ops", { label: "cc-set-dir", map: { command: "$.event.data.payload.command", text: "$.event.data.payload.text", threadId: "$.event.data.payload.threadId", references: "$.event.data.payload.references" } })] },
+              ], [
+                // Else: info/config commands + passthrough (sessions, config, model, etc.)
+                action("CC: Run Command", { label: "cc-command", map: { command: "$.event.data.payload.command", text: "$.event.data.payload.text", threadId: "$.event.data.payload.threadId", references: "$.event.data.payload.references" } }),
+              ], "CC Command Router"),
+            ],
+          },
+        ], undefined, "CC Command Gate"),
       ]],
       "CC command",
     ),

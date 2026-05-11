@@ -7,6 +7,7 @@
  */
 
 import type { ActionMeta, Services, Z } from '../../types';
+import { getClaudeState } from './_helpers/thread-context';
 
 export const meta: ActionMeta = {
   label: 'CC: Run Command',
@@ -57,6 +58,7 @@ const handlers: Record<string, Handler> = {
   memory: handleMemory,
   skills: handleSkills,
   stats: handleStats,
+  rename: handleRename,
   // Passthrough commands — exec and relay stdout
   ...Object.fromEntries(
     Object.entries(PASSTHROUGH).map(([name, spec]) => [name, makePassthroughHandler(spec)]),
@@ -232,4 +234,66 @@ async function handleStats(
   return { text: lines.join('\n'), data: { version, auth, settings } };
 }
 
+async function handleRename(
+  args: string[],
+  services: Services,
+  threadId?: string,
+): Promise<{ text: string; data?: any }> {
+  if (!threadId) return { text: 'No active thread — run a Claude Code turn first.' };
 
+  const ccState = getClaudeState(services, threadId);
+  const sessionId = ccState?.sessionId;
+  if (!sessionId) return { text: 'No active session — run a Claude Code turn first.' };
+
+  let newTitle: string;
+
+  if (args.length > 0) {
+    newTitle = args.join(' ');
+  } else {
+    newTitle = await generateTitle(services, threadId);
+  }
+
+  // /rename is REPL-only — doesn't work via `claude -p`. Use direct JSONL rename.
+  await services.cli.claudeCode.renameSession(sessionId, newTitle, {
+    ...(ccState.cwd && { cwd: ccState.cwd }),
+  });
+
+  services.repository.threadCommands.update(threadId as any, { topic: newTitle });
+  services.emitter.sendToPlugin('threads', {
+    type: 'THREAD_UPDATED',
+    threadId,
+    updates: { topic: newTitle },
+  });
+
+  return { text: `Renamed to: ${newTitle}` };
+}
+
+async function generateTitle(services: Services, threadId: string): Promise<string> {
+  const threadData = services.repository.chatQueries.threadData(threadId as any);
+  const messages = threadData?.messages ?? [];
+
+  if (messages.length === 0) return 'Untitled';
+
+  const serialized = messages
+    .filter((m: any) => !m.compacted && m.status !== 'cancelled' && !m.deleted && m.text)
+    .slice(-10)
+    .map((m: any) => {
+      const role = m.sender === 'user' ? 'User' : 'Assistant';
+      return `[${role}] ${m.text}`;
+    })
+    .join('\n');
+
+  if (!serialized) return 'Untitled';
+
+  const handle = await services.cli.claudeCode.query({
+    prompt: `Generate a short, descriptive title (3-6 words, no quotes) for this conversation:\n\n${serialized}`,
+    permissionMode: 'plan',
+    allowedTools: [],
+    noSessionPersistence: true,
+    maxTurns: 1,
+  });
+
+  for await (const _ev of handle.events) { /* drain */ }
+  const result = await handle.result;
+  return result.text?.trim().replace(/^["']|["']$/g, '') || 'Untitled';
+}

@@ -1,5 +1,5 @@
 import type { ActionMeta, EntityId, Services } from '../../../types';
-import { getOnboardingState, persistOnboardingState, finishOnboarding, flashSuccess } from '../onboarding-helpers';
+import { getOnboardingState, persistOnboardingState, finishOnboarding, flashState } from '../onboarding-helpers';
 import { testCliAndAdvance } from './handle-welcome-step';
 
 export const meta: ActionMeta = {
@@ -18,10 +18,11 @@ The app looks for the Claude Code CLI in these locations:
 
 1. **Settings path** — Check Settings > General > CLI Paths > claude-code
 2. **Local install** — \`~/.claude/local/claude\`
-3. **Homebrew** — \`/opt/homebrew/bin/claude\`
-4. **Standard Unix** — \`/usr/local/bin/claude\`
-5. **NVM** — \`~/.nvm/versions/node/*/bin/claude\`
-6. **System PATH** — Bare \`claude\` command
+3. **User local** — \`~/.local/bin/claude\`
+4. **Homebrew** — \`/opt/homebrew/bin/claude\`
+5. **Standard Unix** — \`/usr/local/bin/claude\`
+6. **NVM** — \`~/.nvm/versions/node/*/bin/claude\`
+7. **System PATH** — Bare \`claude\` command
 
 ### Steps to fix
 
@@ -56,14 +57,13 @@ export async function action(
   if (!state) return { success: false, reason: 'no-state' };
 
   if (response === 'retest') {
-    flashSuccess(services, threadId, 'paused');
+    flashState(services, threadId);
     await testCliAndAdvance(services, state, threadId);
     persistOnboardingState(services, threadId, state);
     return { success: true, step: state.step };
   }
 
   if (response === 'skip') {
-    flashSuccess(services, threadId, 'idle');
     services.chat.sendBlockMessage({
       threadId,
       text: "No problem! Currently we only support Claude Code. You can come back later once you've installed it and test through Settings.",
@@ -75,7 +75,7 @@ export async function action(
     return { success: true, step: state.step };
   }
 
-  flashSuccess(services, threadId, 'paused');
+  flashState(services, threadId);
   // Initial response: "yes" or "no" — create a markdown artifact for guidance
   const markdownContent = response === 'yes' ? DEBUGGING_MD : SETUP_GUIDE_MD;
   const artifactTitle = response === 'yes' ? 'Troubleshooting CLI' : 'Getting Started with Claude Code';

@@ -13,8 +13,10 @@
 **cc-import**: [all] [no-limit] (imports up to 50 from current dir by default; "all" imports from all dirs; "no-limit" removes cap)
 **cc-add-dir**: <path> [--remember]
 **cc-set-dir**: <path> (set working directory for new threads)
+**cc-rename**: New name (optional, auto-generates if omitted)
 **cc-fork**: Fork from last assistant message
 **cc-stats**: Show version, auth, and config info
 **cc-doctor**: Diagnose installation
 **cc-mcp**: Manage MCP servers
 **cc-agents**: List configured agents
+**instructions**: Thread instructions text

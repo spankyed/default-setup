@@ -44,13 +44,13 @@ const settings: SettingsData = {
         code: true,
         library: true,
         flows: true,
-        actions: true,
-        prompts: true,
-        brain: true,
-        database: true,
-        logs: true,
+        actions: false,
+        prompts: false,
+        brain: false,
+        database: false,
+        logs: false,
         settings: true,
-        blank: true,
+        // blank: false,
       }
     },
     code: {
@@ -98,11 +98,11 @@ const settings: SettingsData = {
             name: 'Work',
             description: 'Implementation and coding mode',
             phases: [
-              { id: 'plan', name: 'Plan', description: 'Strategic planning and task breakdown', color: '#84CC16' },
+              { id: 'plan', name: 'Plan', description: 'Strategic planning and task breakdown', color: '#3B82F6' },
               { id: 'edit', name: 'Edit', description: 'Implementation and development', color: '#6B7280' },
             ]
           },
-          { id: 'manager', name: 'Manager', description: 'Delegate tasks and coordinate agents' },
+          { id: 'manager', name: 'Manager', description: 'Delegate tasks and coordinate agents', hidden: true },
         ],
         hotkeys: {
           textToSpeech: { key: 'r', modifiers: ['cmd'], global: true },
