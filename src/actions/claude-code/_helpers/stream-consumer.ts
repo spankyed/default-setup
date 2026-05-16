@@ -609,7 +609,7 @@ export async function consumeStream(
     }
     log.debug('stream consumer completed');
 
-    // Close stdin so the CLI process exits cleanly (prevents child leak).
+    // Close stdin so the CLI subprocess exits cleanly (prevents child leak).
     try { await handle.close(); } catch (closeErr: any) {
       log.debug('handle.close failed', { message: closeErr?.message });
     }
@@ -650,7 +650,7 @@ export async function consumeStream(
 
     // Fire-and-forget: query /context in the background AFTER all turn
     // cleanup (clearHandle, setRunning, queued replay, cc.stream.completed)
-    // so a concurrent new turn doesn't race with this process for the
+    // so a concurrent new turn doesn't race with this instance for the
     // same session JSONL.
     if (!isErrorResult && result.sessionId) {
       queryContextInBackground(services, threadId, result.sessionId, ctx.sessionCwd, log);
@@ -729,7 +729,7 @@ export async function consumeStream(
     finalizeSessionError(services, threadId, writer, message, writer.text);
     services.chat.updateMessageState(currentMessageId as any, { forkable: true } as any);
 
-    // Kill the CLI process on error (it may be in a bad state).
+    // Kill the CLI subprocess on error (it may be in a bad state).
     try { handle.kill(); } catch { /* already gone */ }
 
     // Critical cleanup — dequeue before setRunning(false) to avoid race.
@@ -807,7 +807,7 @@ async function replayQueuedMessage(
     updateChatState(services, threadId, 'idle');
     services.chat.sendBlockMessage({
       threadId,
-      text: `⚠️ Couldn't process queued message: ${message}`,
+      text: `⚠️ Couldn't handle queued message: ${message}`,
       blocks: [],
       forkable: false,
     });
@@ -851,7 +851,7 @@ function stripToolUseErrorEnvelope(raw: string): string {
 const CONTEXT_THRESHOLDS = [25, 50, 75, 90];
 
 /**
- * Query /context in a separate non-persisted CLI process and update the
+ * Query /context in a separate non-persisted CLI instance and update the
  * thread context directly when done. Fire-and-forget — never blocks
  * the turn completion flow.
  */

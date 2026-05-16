@@ -4,6 +4,105 @@ import * as ai from 'ai';
 import { CoreMessage } from 'ai';
 import { BrowserType, ElementHandle, Page, Browser, BrowserContext, chromium, firefox, webkit } from 'playwright';
 
+interface HermesSession {
+    id: string;
+    model: string;
+    source: string;
+    message_count: number;
+    updated_at: number;
+    title: string;
+    started_at: number;
+}
+interface HermesModel {
+    name: string;
+    provider: string;
+    model: string;
+}
+interface HermesSkill {
+    name: string;
+    category: string;
+    path: string;
+    content: string;
+}
+interface HermesTool {
+    name: string;
+    enabled: boolean;
+    description: string;
+}
+type HermesMemoryFiles = Record<string, string>;
+interface HermesConfig {
+    /** HERMES_HOME directory (defaults to ~/.hermes). */
+    hermesHome?: string;
+    /** Default model for new sessions. */
+    defaultModel?: string;
+    /** Default workspace directory. */
+    defaultWorkspace?: string;
+    /** Auto-start bridge on app launch. */
+    autoStart?: boolean;
+    /** LLM provider API key. */
+    apiKey?: string;
+    /** LLM provider (openai, anthropic). */
+    provider?: string;
+}
+type BridgeStatus = 'stopped' | 'starting' | 'ready' | 'error';
+type InstallStatus = 'unknown' | 'not_installed' | 'installing' | 'installed' | 'error';
+interface BridgeInfo {
+    status: BridgeStatus;
+    installStatus: InstallStatus;
+    version: string | null;
+    pid: number | null;
+    error?: string;
+    /** How hermes-agent was detected (e.g. 'PATH', 'managed venv', 'curl installer', 'sibling repo'). */
+    source?: string;
+}
+
+/**
+ * Hermes Agent Bridge Client — manages the Python subprocess lifecycle.
+ *
+ * Spawns `hermes-bridge.py` as a child process and communicates via JSONL
+ * over stdin/stdout. Provides both request/response and streaming APIs.
+ *
+ * Detects existing hermes-agent installations (PATH, curl installer, pipx,
+ * repo clone) before falling back to a managed venv at ~/.agentbuddy/hermes-venv/.
+ */
+
+declare class HermesBridgeClient {
+    private process;
+    private readline;
+    private pending;
+    private _status;
+    private _installStatus;
+    private _version;
+    private _source;
+    private _error;
+    private _config;
+    private _resolvedPython;
+    private _readyResolve;
+    private _readyTimeout;
+    constructor(config?: HermesConfig);
+    get status(): BridgeStatus;
+    get installStatus(): InstallStatus;
+    get info(): BridgeInfo;
+    /**
+     * Install hermes-agent into the managed venv (fallback when no existing install detected).
+     * Calls `onProgress` with status messages for UI feedback.
+     */
+    install(onProgress?: (msg: string) => void): Promise<void>;
+    /**
+     * Check installation status by resolving an existing hermes-agent Python.
+     * Returns 'installed' if found anywhere, 'not_installed' otherwise.
+     */
+    checkInstall(): InstallStatus;
+    start(): Promise<BridgeInfo>;
+    stop(): Promise<void>;
+    restart(): Promise<BridgeInfo>;
+    updateConfig(config: Partial<HermesConfig>): void;
+    send<T = Record<string, unknown>>(method: string, params?: Record<string, unknown>): Promise<T>;
+    sendStreaming(method: string, params: Record<string, unknown>, onEvent: (type: string, data: Record<string, unknown>) => void): Promise<Record<string, unknown>>;
+    private _write;
+    private _handleLine;
+}
+
 interface FileEntry {
     name: string;
     isDirectory: boolean;
@@ -130,6 +229,27 @@ interface BaseEntity {
     entityType: EARS.Entity;
     createdAt: number;
     updatedAt?: number;
+}
+
+/**
+ * Hermes management system types — events and data shapes.
+ */
+
+interface HermesConnectedData {
+    bridge: BridgeInfo;
+    skills: HermesSkill[];
+    models: HermesModel[];
+    tools: {
+        tools: HermesTool[];
+        enabledToolsets: string[];
+    };
+    persona: {
+        content: string;
+        path: string;
+    };
+    memory: HermesMemoryFiles;
+    workspaces: string[];
+    sessions: HermesSession[];
 }
 
 type TokenSource = 'GITHUB_TOKEN' | 'keyring' | 'unknown';
@@ -680,6 +800,11 @@ type OutgoingActionEvents = {
         totalPages: number;
     };
 } | {
+    type: 'ACTIONS_ALL_LOADED';
+    data: {
+        actions: ActionEntity[];
+    };
+} | {
     type: 'ACTIONS_IMPORTED';
     count: number;
     errors?: string[];
@@ -764,6 +889,11 @@ type OutgoingPromptEvents = {
         totalPages: number;
     };
 } | {
+    type: 'PROMPTS_ALL_LOADED';
+    data: {
+        prompts: PromptEntity[];
+    };
+} | {
     type: 'PROMPTS_IMPORTED';
     count: number;
     errors?: string[];
@@ -793,7 +923,7 @@ declare const LogEntry: z.ZodObject<{
     id: string;
     timestamp: number;
     message: string;
-    level: "debug" | "info" | "warn" | "error";
+    level: "error" | "debug" | "info" | "warn";
     meta?: Record<string, any> | undefined;
     source?: string | undefined;
     stack?: string | undefined;
@@ -801,7 +931,7 @@ declare const LogEntry: z.ZodObject<{
     id: string;
     timestamp: number;
     message: string;
-    level: "debug" | "info" | "warn" | "error";
+    level: "error" | "debug" | "info" | "warn";
     meta?: Record<string, any> | undefined;
     source?: string | undefined;
     stack?: string | undefined;
@@ -2882,6 +3012,8 @@ type AgentThreadData = {
     pinned?: boolean;
     chatState?: string;
     context?: ThreadContext;
+    nextCursor?: string | null;
+    hasMore?: boolean;
 };
 type RecentThreadRefreshData = {
     recentThreads: Partial<ThreadEntity>[];
@@ -3078,6 +3210,12 @@ type OutgoingThreadsEvents = {
     type: 'THREAD_CHAT_ERROR';
     threadId: string;
     error: string;
+} | {
+    type: 'MESSAGES_PAGE_LOADED';
+    threadId: string;
+    messages: Partial<MessageEntity>[];
+    nextCursor: string | null;
+    hasMore: boolean;
 };
 interface ThreadsContext {
 }
@@ -3290,6 +3428,7 @@ declare const allDefs: readonly [SystemDefinition<"settings", ({
             label: string;
         }[];
     };
+    cwdOverride?: string;
 } | {
     type: "TOGGLE_COMPACTED";
     markerId: string;
@@ -3305,6 +3444,10 @@ declare const allDefs: readonly [SystemDefinition<"settings", ({
     type: "GET_ARCHIVED_THREADS";
 } | {
     type: "REFRESH_THREADS";
+} | {
+    type: "LOAD_MORE_MESSAGES";
+    threadId: string;
+    cursor: string;
 }) | ThreadsInternalEvents, OutgoingThreadsEvents, ThreadsContext>, SystemDefinition<"flows", ({
     type: "FLOW_SELECT";
     flowId: string;
@@ -3447,6 +3590,8 @@ declare const allDefs: readonly [SystemDefinition<"settings", ({
     type: "FETCH_PROMPTS_PAGE";
     page?: number;
 } | {
+    type: "FETCH_ALL_PROMPTS";
+} | {
     type: "IMPORT_PROMPTS";
     prompts: any;
 } | {
@@ -3482,6 +3627,8 @@ declare const allDefs: readonly [SystemDefinition<"settings", ({
 } | {
     type: "FETCH_ACTIONS_PAGE";
     page?: number;
+} | {
+    type: "FETCH_ALL_ACTIONS";
 } | {
     type: "IMPORT_ACTIONS";
     actions: any;
@@ -3635,7 +3782,105 @@ declare const allDefs: readonly [SystemDefinition<"settings", ({
     type: "EXPORT_NOTES";
     directory: string;
     format: "markdown" | "json";
-}, OutgoingNotesEvents, {}>];
+}, OutgoingNotesEvents, {}>, SystemDefinition<"hermes", {
+    type: "HERMES_INSTALL";
+} | {
+    type: "HERMES_START_BRIDGE";
+} | {
+    type: "HERMES_STOP_BRIDGE";
+} | {
+    type: "HERMES_CHECK_CONNECTION";
+} | {
+    type: "HERMES_GET_SKILLS";
+} | {
+    type: "HERMES_SAVE_SKILL";
+    name: string;
+    category?: string;
+    content: string;
+} | {
+    type: "HERMES_DELETE_SKILL";
+    path: string;
+} | {
+    type: "HERMES_GET_PERSONA";
+} | {
+    type: "HERMES_UPDATE_PERSONA";
+    content: string;
+} | {
+    type: "HERMES_GET_MEMORY";
+} | {
+    type: "HERMES_WRITE_MEMORY";
+    filename: string;
+    content: string;
+} | {
+    type: "HERMES_GET_TOOLS";
+} | {
+    type: "HERMES_GET_MODELS";
+} | {
+    type: "HERMES_GET_WORKSPACES";
+} | {
+    type: "HERMES_UPDATE_CONFIG";
+    provider?: string;
+    apiKey?: string;
+    model?: string;
+}, {
+    type: "HERMES_CONNECTED";
+    data: HermesConnectedData;
+} | {
+    type: "HERMES_INSTALL_STATUS";
+    installStatus: string;
+    version: string | null;
+    source?: string;
+    error?: string;
+} | {
+    type: "HERMES_BRIDGE_STATUS";
+    bridge: BridgeInfo;
+} | {
+    type: "HERMES_SKILLS_DATA";
+    skills: HermesSkill[];
+} | {
+    type: "HERMES_SKILL_SAVED";
+    saved: boolean;
+    path: string;
+} | {
+    type: "HERMES_SKILL_DELETED";
+    deleted: boolean;
+} | {
+    type: "HERMES_PERSONA_DATA";
+    content: string;
+    path: string;
+} | {
+    type: "HERMES_PERSONA_UPDATED";
+    written: boolean;
+} | {
+    type: "HERMES_MEMORY_DATA";
+    files: Record<string, string>;
+} | {
+    type: "HERMES_MEMORY_WRITTEN";
+    written: boolean;
+    filename: string;
+} | {
+    type: "HERMES_TOOLS_DATA";
+    tools: Array<{
+        name: string;
+        enabled: boolean;
+        description: string;
+    }>;
+    enabledToolsets: string[];
+} | {
+    type: "HERMES_MODELS_DATA";
+    models: Array<{
+        name: string;
+        provider: string;
+        model: string;
+    }>;
+} | {
+    type: "HERMES_WORKSPACES_DATA";
+    workspaces: string[];
+} | {
+    type: "HERMES_ERROR";
+    message: string;
+    method: string;
+}, {}>];
 type AllDefs = (typeof allDefs)[number];
 type IncomingSystemEvents = AllDefs['_incoming'];
 type OutgoingSystemEvents = AllDefs['_outgoing'];
@@ -3895,6 +4140,7 @@ interface ThreadsSettings {
     recentThreadsLimit: number;
     recentThreadsSortOrder: 'created' | 'visited' | 'message';
     recordingLimitMinutes: number;
+    skipArchiveConfirm?: boolean;
     chat?: AgentSettings;
 }
 interface NotesSettings {
@@ -4114,6 +4360,9 @@ interface CodeSettings {
     autoFetchRemote?: boolean;
     autoFetchIntervalSeconds?: number;
     terminalScripts?: TerminalScript[];
+    showStashes?: boolean;
+    showCommits?: boolean;
+    showWorktrees?: boolean;
 }
 type CodeConnectedData = {
     baseDirectory: string | null;
@@ -5535,6 +5784,11 @@ declare const services: {
         readonly chatQueries: {
             readonly hasRequiredApiKeys: () => boolean;
             readonly threadArtifacts: (threadId: EARS.EntityId) => ArtifactItem[];
+            readonly threadMessages: (threadId: EARS.EntityId, pageSize?: number, cursor?: string | null) => {
+                messages: Partial<MessageEntity>[];
+                nextCursor: string | null;
+                hasMore: boolean;
+            };
             readonly threadData: (threadId: EARS.EntityId) => AgentThreadData;
             readonly refreshThreadsData: () => RecentThreadRefreshData;
             readonly connectedData: () => AgentConnectedData;
@@ -5921,6 +6175,84 @@ declare const services: {
     cli: CliServiceType;
     filesystem: FilesystemServiceType;
     threads: typeof threads;
+    hermes: {
+        readonly bridge: HermesBridgeClient;
+        readonly installStatus: InstallStatus;
+        checkInstall(): InstallStatus;
+        install(onProgress?: (msg: string) => void): Promise<void>;
+        start(config?: HermesConfig): Promise<BridgeInfo>;
+        stop(): Promise<void>;
+        updateConfig(config: {
+            provider?: string;
+            apiKey?: string;
+            model?: string;
+        }): Promise<void>;
+        restart(config?: HermesConfig): Promise<BridgeInfo>;
+        readonly info: BridgeInfo;
+        health(): Promise<{
+            status: string;
+            agent_available: boolean;
+        }>;
+        sessions: {
+            list(): Promise<HermesSession[]>;
+            get(sessionId: string): Promise<Record<string, unknown>>;
+            create(opts?: {
+                model?: string;
+                workspace?: string;
+                title?: string;
+            }): Promise<Record<string, unknown>>;
+        };
+        chat(params: {
+            sessionId?: string;
+            message: string;
+            model?: string;
+            workspace?: string;
+        }, onEvent: (type: string, data: Record<string, unknown>) => void): Promise<Record<string, unknown>>;
+        cancelStream(streamId: string): Promise<{
+            cancelled: boolean;
+        }>;
+        models: {
+            list(): Promise<HermesModel[]>;
+        };
+        skills: {
+            list(): Promise<HermesSkill[]>;
+            save(skill: {
+                name: string;
+                category?: string;
+                content: string;
+            }): Promise<{
+                saved: boolean;
+                path: string;
+            }>;
+            delete(skillPath: string): Promise<{
+                deleted: boolean;
+            }>;
+        };
+        memory: {
+            get(): Promise<HermesMemoryFiles>;
+            write(filename: string, content: string): Promise<{
+                written: boolean;
+            }>;
+        };
+        tools: {
+            list(): Promise<{
+                tools: HermesTool[];
+                enabledToolsets: string[];
+            }>;
+        };
+        persona: {
+            get(): Promise<{
+                content: string;
+                path: string;
+            }>;
+            update(content: string): Promise<{
+                written: boolean;
+            }>;
+        };
+        workspaces: {
+            list(): Promise<string[]>;
+        };
+    };
 };
 
 /**
