@@ -11,15 +11,16 @@
  * `_helpers/stream-consumer.ts`.
  *
  * Triggered from the "Claude Code" flow when a user.message arrives with
- * `mode === 'claude-code'`.
+ * `mode === 'Claude Code'`.
  */
 
 import type { ActionMeta, Services, Z, EntityId } from '../../types';
 import { createStreamWriter } from './_helpers/stream-writer';
 import { createToolActivityWriter } from './_helpers/tool-activity-writer';
 import { createThinkingWriter } from './_helpers/thinking-writer';
-import { getClaudeState, persistClaudeState, setRunning, enqueueMessage, killTurn, ensureSessionMarker, updateChatState, extractStaleSessionId } from './_helpers/thread-context';
+import { getClaudeState, persistClaudeState, setRunning, enqueueMessage, killTurn, ensureSessionMarker, updateChatState, extractStaleSessionId, markSessionBroken } from './_helpers/thread-context';
 import { consumeStream, finalizeSessionError } from './_helpers/stream-consumer';
+import { buildSessionBootstrapPrompt } from '../_helpers/session-bootstrap';
 
 export const meta: ActionMeta = {
   label: 'Claude Code Chat',
@@ -29,7 +30,7 @@ export const meta: ActionMeta = {
     threadId: { type: 'string', description: 'Target thread', required: true },
     text: { type: 'string', description: 'User message text', required: true },
     mode: { type: 'string', description: 'Agent mode (passed through from user.message)', required: false },
-    phase: { type: 'string', description: 'Sub-phase within mode (plan/edit/review)', required: false },
+    phase: { type: 'string', description: 'Sub-phase within mode (Plan/Edit/review)', required: false },
     model: { type: 'string', description: 'Override Claude model (alias or full id)', required: false },
     allowedTools: { type: 'array', description: 'Tools allowed without prompting', required: false },
     disallowedTools: { type: 'array', description: 'Tools always denied', required: false },
@@ -63,9 +64,12 @@ const DEFAULT_ALLOWED_TOOLS = [
 ];
 
 const PHASE_TIP_PROMPTS: Record<string, string> = {
-  plan: 'Plan Phase Tips System',
-  edit: 'Edit Phase Tips System',
+  Plan: 'Plan Phase Tips System',
+  Edit: 'Edit Phase Tips System',
 };
+
+export const phaseTipPromptLabel = (phase: string | undefined) =>
+  phase ? PHASE_TIP_PROMPTS[phase] : undefined;
 
 export async function action(
   params: Record<string, any>,
@@ -105,7 +109,7 @@ export async function action(
 
   // Resume any prior conversation parked on this thread.
   const prior = getClaudeState(services, threadId);
-  const resumeSessionId = prior?.sessionId || undefined;
+  let resumeSessionId = prior?.sessionId || undefined;
   let forkFrom = prior?.forkFrom;
   let revertTo = prior?.revertTo;
 
@@ -146,6 +150,18 @@ export async function action(
     revert: revertTo?.cliUuid ?? null,
   });
 
+  // ─── Fork-pending guard ────────────────────────────────────────────
+  // The backend forkThread action sets forkPending before navigation.
+  // Queue the message until CC: Handle Fork finishes persisting state.
+  if (prior?.forkPending) {
+    log.debug('fork in progress — queuing message', { threadId });
+    enqueueMessage(services, threadId, { text, mode: params.mode as string, phase, messageId: userMessageId, references });
+    if (userMessageId) {
+      services.chat.updateMessageState(userMessageId as any, { status: 'queued' } as any);
+    }
+    return { success: true, queued: true };
+  }
+
   // ─── Concurrency guard ──────────────────────────────────────────────
   log.info('[concurrency-guard] state snapshot', {
     threadId,
@@ -155,12 +171,19 @@ export async function action(
   });
 
   if (prior?.isRunning) {
-    log.debug('action already running — queuing message', { threadId });
-    enqueueMessage(services, threadId, { text, mode: params.mode as string, phase, messageId: userMessageId, references });
-    if (userMessageId) {
-      services.chat.updateMessageState(userMessageId as any, { status: 'queued' } as any);
+    // Handle exists → CLI process is genuinely running, queue the message
+    const handleExists = !!(services.cli as any).claudeCode.getHandle(threadId);
+    if (handleExists) {
+      log.debug('action already running — queuing message', { threadId });
+      enqueueMessage(services, threadId, { text, mode: params.mode as string, phase, messageId: userMessageId, references });
+      if (userMessageId) {
+        services.chat.updateMessageState(userMessageId as any, { status: 'queued' } as any);
+      }
+      return { success: true, queued: true };
     }
-    return { success: true, queued: true };
+    // No handle → stale isRunning from a previous process, clear and proceed
+    log.info('[concurrency-guard] stale isRunning (no handle) — clearing', { threadId });
+    setRunning(services, threadId, false);
   }
 
   // If the turn is paused on a permission prompt (isRunning=false but
@@ -178,6 +201,15 @@ export async function action(
   // Mark this thread as having an active turn.
   setRunning(services, threadId, true);
 
+  // Race guard: if a parallel invocation (from a duplicate flow actor)
+  // already stored a CLI handle for this thread, bail out to prevent
+  // creating orphaned "Thinking…" placeholder messages.
+  const existingHandle = (services.cli as any).claudeCode.getHandle(threadId);
+  if (existingHandle) {
+    log.warn('[concurrency-guard] parallel invocation detected — bailing', { threadId });
+    return { success: false, error: 'parallel invocation' };
+  }
+
   // Disable fork on user messages in Claude Code threads. Forking from a
   // user message creates a mismatch: the app shows the message but the CLI
   // session truncates to the preceding assistant message, so the LLM has
@@ -193,7 +225,7 @@ export async function action(
   const forceDirectoryPicker = params.forceDirectoryPicker as boolean | undefined;
 
   const codeSettings = services.repository.settingsQueries.getPluginSettings('code') as any;
-  const hasCwd = codeSettings?.defaultBaseDirectory || codeSettings?.lastDirectoryOpened || prior?.cwd;
+  const hasCwd = codeSettings?.defaultBaseDirectory || codeSettings?.baseDirectory || prior?.cwd;
   if (forceDirectoryPicker || (!hasCwd && !cwdOverride)) {
     const projects = (services.repository.settingsQueries.getGeneralSettings('projects') as any[]) || [];
     const blocks: any[] = [
@@ -258,12 +290,24 @@ export async function action(
 
   // Read the user's current permission-mode and worktree choices.
   const activePermissionMode = prior?.permissionMode ?? 'acceptEdits';
-  const effectivePermissionMode = phase === 'plan' ? 'plan' : activePermissionMode;
+  const effectivePermissionMode = phase === 'Plan' ? 'plan' : activePermissionMode;
   const useWorktree = prior?.useWorktree ?? false;
   log.debug('active settings', { permissionMode: effectivePermissionMode, worktree: useWorktree });
 
+  // Worktree mismatch: the CLI can't resume a session across CWD changes
+  // because --worktree shifts the project bucket the JSONL is looked up from.
+  // Treat undefined sessionWorktree as non-worktree (pre-tracking sessions).
+  if (resumeSessionId && (prior?.sessionWorktree ?? false) !== useWorktree) {
+    log.info('[worktree] session/toggle mismatch — clearing session', {
+      threadId, resumeSessionId,
+      sessionWorktree: prior?.sessionWorktree, useWorktree,
+    });
+    persistClaudeState(services, threadId, { sessionId: undefined, sessionWorktree: undefined });
+    resumeSessionId = undefined;
+  }
+
   // Phase-aware system-prompt nudging (plan/edit/review).
-  const tipLabel = phase ? PHASE_TIP_PROMPTS[phase] : undefined;
+  const tipLabel = phaseTipPromptLabel(phase);
   const phaseTip = tipLabel ? services.prompt.usePrompt(tipLabel, {}) : undefined;
   const composedSystemPrompt = [phaseTip, systemPrompt].filter(Boolean).join('\n\n') || undefined;
 
@@ -284,11 +328,19 @@ export async function action(
     // lock the thread in isRunning=true.
     const resolved = await services.chat.resolveReferences(references);
     const fullText = resolved.textPrefix ? `${resolved.textPrefix}\n\n${text}` : text;
-    let prompt: any = fullText;
+    const promptText = !resumeSessionId && !forkFrom && !revertTo
+      ? buildSessionBootstrapPrompt(services, {
+        threadId,
+        currentMessageId: userMessageId,
+        currentText: fullText,
+        providerName: 'Claude Code',
+      })
+      : fullText;
+    let prompt: any = promptText;
     if (resolved.imageBlocks.length > 0) {
       prompt = {
         type: 'user',
-        message: { role: 'user', content: [{ type: 'text', text: fullText }, ...resolved.imageBlocks] },
+        message: { role: 'user', content: [{ type: 'text', text: promptText }, ...resolved.imageBlocks] },
         parent_tool_use_id: null,
       };
     }
@@ -309,22 +361,73 @@ export async function action(
     });
     // When resuming, use the CWD where the session was originally created so
     // the CLI can locate the session JSONL in the correct project bucket.
-    // For new sessions, use cwdOverride if provided (from "new thread in project" menu).
-    sessionCwd = resumeSessionId ? prior?.cwd : (cwdOverride || undefined);
+    // For new sessions, fallback chain:
+    //   cwdOverride — explicit directory from "New Thread in Project" menu (one-shot)
+    //   prior?.cwd — thread already had a session (e.g. expired/broken); keep its project dir
+    //                even if the user navigated elsewhere since then
+    //   baseDirectory / defaultBaseDirectory — current base directory from settings
+    sessionCwd = resumeSessionId
+      ? prior?.cwd
+      : (cwdOverride || prior?.cwd || codeSettings?.baseDirectory || codeSettings?.defaultBaseDirectory || undefined);
 
-    // Fallback: if resuming but prior.cwd is missing, try project settings
-    // so the CLI doesn't fall back to its own cwd (wrong directory).
+    // Fallback: if resuming but prior.cwd is missing, try project settings —
+    // but only if the session file actually exists under that directory.
+    // Blindly using defaultBaseDirectory when it differs from the thread's
+    // original cwd causes "session not found" (wrong project bucket).
     if (resumeSessionId && !sessionCwd) {
-      sessionCwd = codeSettings?.defaultBaseDirectory || codeSettings?.lastDirectoryOpened || undefined;
-      log.warn('[resume] sessionId exists but sessionCwd is missing — falling back to project settings', {
-        threadId, resumeSessionId, revertTo: revertTo?.cliUuid ?? null, fallbackCwd: sessionCwd ?? 'NONE',
-      });
+      const fallbackCwd = codeSettings?.defaultBaseDirectory || codeSettings?.baseDirectory || undefined;
+      if (fallbackCwd) {
+        const exists = await services.cli.claudeCode.sessionExists(resumeSessionId, { cwd: fallbackCwd });
+        if (exists) {
+          sessionCwd = fallbackCwd;
+          persistClaudeState(services, threadId, { cwd: fallbackCwd });
+          log.info('[resume] recovered sessionCwd via fallback check', { threadId, fallbackCwd });
+        } else {
+          log.warn('[resume] session not found under fallback CWD either', {
+            threadId, resumeSessionId, fallbackCwd,
+          });
+        }
+      }
+      if (!sessionCwd) {
+        log.warn('[resume] cannot determine session CWD — aborting resume', {
+          threadId, resumeSessionId, revertTo: revertTo?.cliUuid ?? null,
+        });
+        const isRevert = !!revertTo;
+        toolActivity.finalise('error');
+        setRunning(services, threadId, false);
+        updateChatState(services, threadId, 'idle');
+        writer.finalize(isRevert
+          ? '⚠️ Could not revert — the project directory for this session is unknown. The session may predate directory tracking.'
+          : '⚠️ Could not resume — the project directory for this session is unknown.');
+        return { success: false, error: 'session CWD unknown', messageId: currentMessageId };
+      }
     }
 
     // Eager persist: store CWD before the query fires so it survives if
     // the turn is killed before the CLI's system/init event arrives.
     if (sessionCwd && !prior?.cwd) {
       persistClaudeState(services, threadId, { cwd: sessionCwd });
+    }
+
+    // Pre-flight: verify the session JSONL exists before spawning the CLI.
+    // Catches externally-deleted sessions (CLI cleanup, manual removal)
+    // with a clear error instead of the generic "session not found" from
+    // the CLI's stderr.
+    if (resumeSessionId && sessionCwd) {
+      const sessionValid = await services.cli.claudeCode.sessionExists(resumeSessionId, { cwd: sessionCwd });
+      if (!sessionValid) {
+        log.warn('[pre-flight] session file missing on disk', {
+          threadId, resumeSessionId, sessionCwd, isRevert: !!revertTo,
+        });
+        const isRevert = !!revertTo;
+        toolActivity.finalise('error');
+        setRunning(services, threadId, false);
+        writer.finalize(isRevert
+          ? '⚠️ Could not revert — the CLI session file no longer exists on disk. It may have been cleaned up by the Claude CLI.'
+          : '⚠️ Could not resume — the CLI session file no longer exists on disk.');
+        markSessionBroken(services, threadId, `Session ${resumeSessionId} file missing`);
+        return { success: false, error: 'session file missing', messageId: currentMessageId };
+      }
     }
 
     const handle = await services.cli.claudeCode.query({
@@ -364,6 +467,7 @@ export async function action(
       isFork: !!(forkFrom || revertTo),
       revertCliUuid: revertTo?.cliUuid,
       forkCliUuid: forkFrom?.cliUuid,
+      useWorktree,
     }, {
       writer, toolActivity, thinking, messageId: currentMessageId as EntityId,
     }).catch((err) => {
@@ -387,7 +491,14 @@ export async function action(
 
     // ─── Session-not-found: clear stale sessionId, mark session broken ──
     if (extractStaleSessionId(message)) {
-      finalizeSessionError(services, threadId as EntityId, writer, message);
+      finalizeSessionError(services, threadId as EntityId, writer, message, undefined, { isRevert: !!revertTo });
+      // Emit cc.stream.completed so CC: Turn Completed can run bookkeeping
+      // (turn counts, cost tracking). Without this, the turn is "lost" from
+      // the flow's perspective.
+      services.emitter.sendToBrainSystem({
+        eventType: 'cc.stream.completed',
+        payload: { threadId, hadErrors: true, error: message },
+      });
       return { success: false, error: message, messageId: currentMessageId };
     }
 

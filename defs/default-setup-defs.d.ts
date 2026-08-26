@@ -20,7 +20,10 @@ declare namespace EARS {
         Settings = "Settings",
         FAQ = "FAQ",
         Secret = "Secret",
-        Note = "Note"
+        Note = "Note",
+        BrowserTab = "BrowserTab",
+        BrowserBookmark = "BrowserBookmark",
+        CalendarEvent = "CalendarEvent"
     }
     export type EntityId = `${Entity}-${string}`;
     const RelKindValues: {
@@ -135,17 +138,21 @@ declare function resolveTracks(entry: Track[] | FlowConfig): Track[];
 /** Role string for the root flow designation */
 declare const ROOT_FLOW_ROLE = "root_flow";
 /**
- * A track represents an event listener + its sequential response steps.
- * The event field creates an implicit listener node.
+ * A track represents a trigger node + its sequential response steps.
+ * Exactly one of `event` or `schedule` must be set.
+ * - `event` creates an implicit listener node
+ * - `schedule` creates an implicit schedule node (cron-based trigger)
  */
 interface Track {
-    /** Event type to listen for (creates a listener node) */
-    event: string;
-    /** Optional label for the listener node (defaults to event type) */
+    /** Event type to listen for (creates a listener node). Mutually exclusive with `schedule`. */
+    event?: string;
+    /** Cron expression (creates a schedule node). Mutually exclusive with `event`. */
+    schedule?: string;
+    /** Optional label for the trigger node (defaults to event type or cron expression) */
     label?: string;
-    /** Optional description for the listener node */
+    /** Optional description for the trigger node */
     description?: string;
-    /** Exit paths from this listener — each inner array is an independent sequential step chain.
+    /** Exit paths from this trigger — each inner array is an independent sequential step chain.
      *  Single-exit: exits: [[step1, step2]]. Parallel: exits: [[chainA...], [chainB...]] */
     exits: DSLStepNode[][];
 }
@@ -227,10 +234,14 @@ interface DSLUpdateNode extends DSLNodeBase {
 interface DSLKeepAliveNode extends DSLNodeBase {
     type: 'keep_alive';
 }
+/** Terminate the containing flow immediately */
+interface DSLKillNode extends DSLNodeBase {
+    type: 'kill';
+}
 /**
  * Union of all step node types (excludes listener - that's implicit in Track.event)
  */
-type DSLStepNode = DSLActionNode | DSLLLMNode | DSLSwitchNode | DSLFireNode | DSLTransformNode | DSLQueryNode | DSLFlowNode | DSLCreateNode | DSLUpdateNode | DSLKeepAliveNode;
+type DSLStepNode = DSLActionNode | DSLLLMNode | DSLSwitchNode | DSLFireNode | DSLTransformNode | DSLQueryNode | DSLFlowNode | DSLCreateNode | DSLUpdateNode | DSLKeepAliveNode | DSLKillNode;
 interface CompiledFlow {
     entity: CompiledEntity[];
     relation: CompiledRelation[];
@@ -324,14 +335,6 @@ interface ExportedLibrary {
 }
 type ExportFormat = 'markdown' | 'json';
 
-interface ActionParameter {
-    type: 'string' | 'number' | 'boolean' | 'object' | 'array' | 'any';
-    description?: string;
-    required?: boolean;
-    default?: any;
-    placeholder?: string;
-}
-
 /**
  * Prompt template types and definitions
  */
@@ -347,6 +350,14 @@ interface TemplateInput {
     defaultValue?: any;
     commonSources?: string[];
     example?: any;
+}
+
+interface ActionParameter {
+    type: 'string' | 'number' | 'boolean' | 'object' | 'array' | 'any';
+    description?: string;
+    required?: boolean;
+    default?: any;
+    placeholder?: string;
 }
 
 interface LinkEvent {

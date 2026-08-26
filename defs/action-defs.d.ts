@@ -1,107 +1,666 @@
+import * as ai from 'ai';
+import { ToolSet, LanguageModelUsage, CoreMessage, FinishReason } from 'ai';
 import { z } from 'zod';
 export { z } from 'zod';
-import * as ai from 'ai';
-import { CoreMessage } from 'ai';
-import { BrowserType, ElementHandle, Page, Browser, BrowserContext, chromium, firefox, webkit } from 'playwright';
+import { BrowserType, ElementHandle, Page, Browser, BrowserContext as BrowserContext, chromium, firefox, webkit } from 'playwright';
 
-interface HermesSession {
-    id: string;
-    model: string;
-    source: string;
-    message_count: number;
-    updated_at: number;
-    title: string;
-    started_at: number;
+/**
+ * Type definitions for the OpenAI ChatGPT OAuth auth service.
+ *
+ * Mirrors the auth flow used by Codex CLI — browser OAuth with PKCE
+ * to auth.openai.com, storing tokens in ~/.codex/auth.json.
+ */
+type AuthMode = 'chatgpt' | 'api-key';
+interface ChatGPTTokens {
+    /** JWT with claims (plan type, account ID, email, etc.) */
+    idToken: string;
+    /** Bearer token for API requests. */
+    accessToken: string;
+    /** For token refresh when access_token expires. */
+    refreshToken: string;
+    /** ChatGPT account/workspace ID (from JWT claims). Used as ChatGPT-Account-ID header. */
+    accountId: string;
 }
-interface HermesModel {
-    name: string;
-    provider: string;
-    model: string;
-}
-interface HermesSkill {
-    name: string;
-    category: string;
-    path: string;
-    content: string;
-}
-interface HermesTool {
-    name: string;
-    enabled: boolean;
-    description: string;
-}
-type HermesMemoryFiles = Record<string, string>;
-interface HermesConfig {
-    /** HERMES_HOME directory (defaults to ~/.hermes). */
-    hermesHome?: string;
-    /** Default model for new sessions. */
-    defaultModel?: string;
-    /** Default workspace directory. */
-    defaultWorkspace?: string;
-    /** Auto-start bridge on app launch. */
-    autoStart?: boolean;
-    /** LLM provider API key. */
+interface AuthState {
+    mode: AuthMode;
+    /** Present when mode === 'chatgpt'. */
+    tokens?: ChatGPTTokens;
+    /** Present when mode === 'api-key'. */
     apiKey?: string;
-    /** LLM provider (openai, anthropic). */
-    provider?: string;
-}
-type BridgeStatus = 'stopped' | 'starting' | 'ready' | 'error';
-type InstallStatus = 'unknown' | 'not_installed' | 'installing' | 'installed' | 'error';
-interface BridgeInfo {
-    status: BridgeStatus;
-    installStatus: InstallStatus;
-    version: string | null;
-    pid: number | null;
-    error?: string;
-    /** How hermes-agent was detected (e.g. 'PATH', 'managed venv', 'curl installer', 'sibling repo'). */
-    source?: string;
+    /** ISO timestamp of last token refresh. */
+    lastRefresh?: string;
 }
 
 /**
- * Hermes Agent Bridge Client — manages the Python subprocess lifecycle.
+ * Type definitions for the model-client service.
  *
- * Spawns `hermes-bridge.py` as a child process and communicates via JSONL
- * over stdin/stdout. Provides both request/response and streaming APIs.
- *
- * Detects existing hermes-agent installations (PATH, curl installer, pipx,
- * repo clone) before falling back to a managed venv at ~/.agentbuddy/hermes-venv/.
+ * Maps OpenAI Responses API concepts to a typed service interface,
+ * built on top of the Vercel AI SDK.
  */
 
-declare class HermesBridgeClient {
-    private process;
-    private readline;
-    private pending;
-    private _status;
-    private _installStatus;
-    private _version;
-    private _source;
-    private _error;
-    private _config;
-    private _resolvedPython;
-    private _readyResolve;
-    private _readyTimeout;
-    constructor(config?: HermesConfig);
-    get status(): BridgeStatus;
-    get installStatus(): InstallStatus;
-    get info(): BridgeInfo;
-    /**
-     * Install hermes-agent into the managed venv (fallback when no existing install detected).
-     * Calls `onProgress` with status messages for UI feedback.
-     */
-    install(onProgress?: (msg: string) => void): Promise<void>;
-    /**
-     * Check installation status by resolving an existing hermes-agent Python.
-     * Returns 'installed' if found anywhere, 'not_installed' otherwise.
-     */
-    checkInstall(): InstallStatus;
-    start(): Promise<BridgeInfo>;
-    stop(): Promise<void>;
-    restart(): Promise<BridgeInfo>;
-    updateConfig(config: Partial<HermesConfig>): void;
-    send<T = Record<string, unknown>>(method: string, params?: Record<string, unknown>): Promise<T>;
-    sendStreaming(method: string, params: Record<string, unknown>, onEvent: (type: string, data: Record<string, unknown>) => void): Promise<Record<string, unknown>>;
-    private _write;
-    private _handleLine;
+/** Model + provider configuration for API calls. Only OpenAI Responses API is supported. */
+interface ModelClientConfig {
+    /** Provider — must be 'openai' or 'openai.responses' (Responses API only). */
+    provider: 'openai' | 'openai.responses';
+    /** Model ID (e.g. 'gpt-4o', 'o3'). */
+    model: string;
+    /** Explicit API key (overrides settings/env). */
+    apiKey?: string;
+    /** Custom base URL for the API. */
+    baseURL?: string;
 }
+/** Configuration for a conversation (persists across turns). */
+interface ConversationConfig extends ModelClientConfig {
+    /** System instructions for the model. */
+    instructions?: string;
+    /** Reasoning configuration for reasoning models. */
+    reasoning?: ReasoningConfig;
+    /** Tools available to the model across all turns. */
+    tools?: ToolSet;
+    /** Whether to store the conversation for analytics. */
+    store?: boolean;
+    /** Arbitrary metadata attached to requests. */
+    metadata?: Record<string, string>;
+    /** Maximum agentic tool-use steps per turn. */
+    maxSteps?: number;
+}
+/** Reasoning configuration for reasoning models (o3, etc). */
+interface ReasoningConfig {
+    effort: 'low' | 'medium' | 'high';
+    summary?: 'auto' | 'concise' | 'detailed';
+}
+/** Parameters for a single turn. */
+interface TurnParams {
+    /** User input — string prompt or structured messages. */
+    input: string | CoreMessage[];
+    /** Per-turn tool overrides (merged with conversation tools). */
+    tools?: ToolSet;
+    /** Per-turn instruction overrides. */
+    instructions?: string;
+    /** Per-turn reasoning overrides. */
+    reasoning?: ReasoningConfig;
+    /** Max agentic steps for this turn (overrides conversation config). */
+    maxSteps?: number;
+    /** AbortSignal for cancellation. */
+    signal?: AbortSignal;
+}
+/** Result of a completed turn. */
+interface TurnResult {
+    /** The response ID from the Responses API. */
+    responseId: string | undefined;
+    /** Final generated text. */
+    text: string;
+    /** Reasoning text (if reasoning model). */
+    reasoning: string | undefined;
+    /** Tool calls made during the turn. */
+    toolCalls: unknown[];
+    /** Tool results returned during the turn. */
+    toolResults: unknown[];
+    /** Token usage for this turn. */
+    usage: LanguageModelUsage;
+    /** Number of agentic steps taken. */
+    steps: number;
+    /** Why the turn finished. */
+    finishReason: FinishReason;
+}
+type StreamEvent = {
+    type: 'text-delta';
+    textDelta: string;
+} | {
+    type: 'reasoning';
+    textDelta: string;
+} | {
+    type: 'tool-call-start';
+    toolCallId: string;
+    toolName: string;
+} | {
+    type: 'tool-call-delta';
+    toolCallId: string;
+    toolName: string;
+    argsTextDelta: string;
+} | {
+    type: 'tool-call';
+    toolCallId: string;
+    toolName: string;
+    args: unknown;
+} | {
+    type: 'tool-result';
+    toolCallId: string;
+    toolName: string;
+    result: unknown;
+} | {
+    type: 'step-complete';
+    usage: LanguageModelUsage;
+    finishReason: FinishReason;
+    isContinued: boolean;
+} | {
+    type: 'turn-complete';
+    usage: LanguageModelUsage;
+    finishReason: FinishReason;
+    responseId: string | undefined;
+} | {
+    type: 'error';
+    error: unknown;
+};
+interface ConversationState {
+    /** Previous response ID for threading. */
+    previousResponseId: string | null;
+    /** Number of turns completed. */
+    turnCount: number;
+    /** Cumulative token usage across all turns. */
+    cumulativeUsage: LanguageModelUsage;
+}
+interface CompactParams {
+    /** The response ID to compact up to. */
+    previousResponseId: string;
+    /** Model to use for compaction (defaults to conversation model). */
+    model?: string;
+}
+interface CompactResult {
+    /** New response ID after compaction. */
+    newResponseId: string;
+    /** Summary text (if returned). */
+    summary?: string;
+}
+/**
+ * Approval callback for tools that modify state.
+ * Returns 'approved' to proceed or 'denied' to skip execution.
+ */
+type ApproveFn = (description: string, detail?: string) => Promise<'approved' | 'denied'>;
+/** Callback to request freeform or multiple-choice input from the user mid-turn. */
+type RequestInputFn = (questions: UserInputQuestion[]) => Promise<Record<string, string>>;
+interface UserInputQuestion {
+    id: string;
+    header: string;
+    question: string;
+    options?: Array<{
+        label: string;
+        description: string;
+    }>;
+}
+interface PlanStep {
+    step: string;
+    status: 'pending' | 'in_progress' | 'completed';
+}
+interface GoalState {
+    objective: string;
+    status: 'active' | 'paused' | 'complete';
+    tokenBudget?: number;
+    tokensUsed?: number;
+}
+/** Common options for tool factory functions. */
+interface ToolOptions {
+    /** Working directory — all paths resolved relative to this. */
+    cwd: string;
+    /** Optional approval callback for user confirmation before execution. */
+    approve?: ApproveFn;
+    /** Called when the model updates its plan. */
+    onPlanUpdate?: (plan: PlanStep[], explanation?: string) => void;
+    /** Called when the model creates or updates a goal. */
+    onGoalUpdate?: (goal: GoalState) => void;
+    /** Returns the current goal state (for get_goal). */
+    getGoal?: () => GoalState | null;
+    /** Callback to request user input mid-turn. */
+    requestInput?: RequestInputFn;
+}
+
+/**
+ * Conversation manager — tracks previous_response_id chains for the
+ * OpenAI Responses API's built-in conversation threading.
+ *
+ * Each Conversation instance is stateful: it tracks the previousResponseId
+ * and cumulative usage across turns. State is purely in-memory.
+ */
+
+declare class Conversation {
+    private _config;
+    private _previousResponseId;
+    private _turnCount;
+    private _cumulativeUsage;
+    constructor(config: ConversationConfig);
+    get state(): ConversationState;
+    get previousResponseId(): string | null;
+    /** Execute a turn with streaming events. */
+    streamTurn(params: TurnParams): AsyncGenerator<StreamEvent>;
+    /** Execute a turn and return the complete result (non-streaming). */
+    generateTurn(params: TurnParams): Promise<TurnResult>;
+    /** Compact the conversation history via the Responses API. */
+    compact(): Promise<CompactResult>;
+    /** Reset conversation state (clear previousResponseId chain). */
+    reset(): void;
+}
+
+/**
+ * Define a tool for the model to call.
+ *
+ * Thin wrapper around the AI SDK's `tool()` for ergonomic definitions.
+ */
+declare function defineTool<T extends z.ZodType>(opts: {
+    description: string;
+    parameters: T;
+    execute: (args: z.infer<T>) => Promise<string>;
+}): ai.Tool<T, string> & {
+    execute: (args: T extends ai.Schema<any> ? T["_type"] : T extends z.ZodTypeAny ? z.TypeOf<T> : never, options: ai.ToolExecutionOptions) => PromiseLike<string>;
+};
+/**
+ * Pre-configured OpenAI web search tool.
+ *
+ * Uses the Responses API's built-in `web_search_preview` tool.
+ */
+declare function webSearchTool(opts?: {
+    searchContextSize?: 'low' | 'medium' | 'high';
+    userLocation?: {
+        type: 'approximate';
+        city?: string;
+        state?: string;
+        country?: string;
+    };
+}): {
+    type: "provider-defined";
+    id: "openai.web_search_preview";
+    args: {};
+    parameters: z.ZodObject<{}, "strip", z.ZodTypeAny, {}, {}>;
+};
+
+declare function shellTool(opts: ToolOptions): ai.Tool<z.ZodObject<{
+    command: z.ZodString;
+    workdir: z.ZodOptional<z.ZodString>;
+    timeout_ms: z.ZodOptional<z.ZodNumber>;
+}, "strip", z.ZodTypeAny, {
+    command: string;
+    workdir?: string | undefined;
+    timeout_ms?: number | undefined;
+}, {
+    command: string;
+    workdir?: string | undefined;
+    timeout_ms?: number | undefined;
+}>, string> & {
+    execute: (args: {
+        command: string;
+        workdir?: string | undefined;
+        timeout_ms?: number | undefined;
+    }, options: ai.ToolExecutionOptions) => PromiseLike<string>;
+};
+declare function readFileTool(opts: Pick<ToolOptions, 'cwd'>): ai.Tool<z.ZodObject<{
+    path: z.ZodString;
+    offset: z.ZodOptional<z.ZodNumber>;
+    limit: z.ZodOptional<z.ZodNumber>;
+}, "strip", z.ZodTypeAny, {
+    path: string;
+    offset?: number | undefined;
+    limit?: number | undefined;
+}, {
+    path: string;
+    offset?: number | undefined;
+    limit?: number | undefined;
+}>, string> & {
+    execute: (args: {
+        path: string;
+        offset?: number | undefined;
+        limit?: number | undefined;
+    }, options: ai.ToolExecutionOptions) => PromiseLike<string>;
+};
+declare function writeFileTool(opts: ToolOptions): ai.Tool<z.ZodObject<{
+    path: z.ZodString;
+    content: z.ZodString;
+}, "strip", z.ZodTypeAny, {
+    content: string;
+    path: string;
+}, {
+    content: string;
+    path: string;
+}>, string> & {
+    execute: (args: {
+        content: string;
+        path: string;
+    }, options: ai.ToolExecutionOptions) => PromiseLike<string>;
+};
+declare function grepTool(opts: Pick<ToolOptions, 'cwd'>): ai.Tool<z.ZodObject<{
+    pattern: z.ZodString;
+    path: z.ZodOptional<z.ZodString>;
+    include: z.ZodOptional<z.ZodString>;
+}, "strip", z.ZodTypeAny, {
+    pattern: string;
+    include?: string | undefined;
+    path?: string | undefined;
+}, {
+    pattern: string;
+    include?: string | undefined;
+    path?: string | undefined;
+}>, string> & {
+    execute: (args: {
+        pattern: string;
+        include?: string | undefined;
+        path?: string | undefined;
+    }, options: ai.ToolExecutionOptions) => PromiseLike<string>;
+};
+declare function listDirTool(opts: Pick<ToolOptions, 'cwd'>): ai.Tool<z.ZodObject<{
+    path: z.ZodString;
+}, "strip", z.ZodTypeAny, {
+    path: string;
+}, {
+    path: string;
+}>, string> & {
+    execute: (args: {
+        path: string;
+    }, options: ai.ToolExecutionOptions) => PromiseLike<string>;
+};
+declare function patchTool(opts: ToolOptions): ai.Tool<z.ZodObject<{
+    path: z.ZodString;
+    patch: z.ZodString;
+}, "strip", z.ZodTypeAny, {
+    path: string;
+    patch: string;
+}, {
+    path: string;
+    patch: string;
+}>, string> & {
+    execute: (args: {
+        path: string;
+        patch: string;
+    }, options: ai.ToolExecutionOptions) => PromiseLike<string>;
+};
+declare function planTool(opts: Pick<ToolOptions, 'onPlanUpdate'>): ai.Tool<z.ZodObject<{
+    plan: z.ZodArray<z.ZodObject<{
+        step: z.ZodString;
+        status: z.ZodEnum<["pending", "in_progress", "completed"]>;
+    }, "strip", z.ZodTypeAny, {
+        status: "completed" | "pending" | "in_progress";
+        step: string;
+    }, {
+        status: "completed" | "pending" | "in_progress";
+        step: string;
+    }>, "many">;
+    explanation: z.ZodOptional<z.ZodString>;
+}, "strip", z.ZodTypeAny, {
+    plan: {
+        status: "completed" | "pending" | "in_progress";
+        step: string;
+    }[];
+    explanation?: string | undefined;
+}, {
+    plan: {
+        status: "completed" | "pending" | "in_progress";
+        step: string;
+    }[];
+    explanation?: string | undefined;
+}>, string> & {
+    execute: (args: {
+        plan: {
+            status: "completed" | "pending" | "in_progress";
+            step: string;
+        }[];
+        explanation?: string | undefined;
+    }, options: ai.ToolExecutionOptions) => PromiseLike<string>;
+};
+declare function goalTool(opts: Pick<ToolOptions, 'onGoalUpdate' | 'getGoal'>): ai.Tool<z.ZodObject<{
+    action: z.ZodEnum<["create", "get", "update"]>;
+    objective: z.ZodOptional<z.ZodString>;
+    token_budget: z.ZodOptional<z.ZodNumber>;
+    status: z.ZodOptional<z.ZodEnum<["active", "paused", "complete"]>>;
+}, "strip", z.ZodTypeAny, {
+    action: "update" | "create" | "get";
+    status?: "active" | "paused" | "complete" | undefined;
+    objective?: string | undefined;
+    token_budget?: number | undefined;
+}, {
+    action: "update" | "create" | "get";
+    status?: "active" | "paused" | "complete" | undefined;
+    objective?: string | undefined;
+    token_budget?: number | undefined;
+}>, string> & {
+    execute: (args: {
+        action: "update" | "create" | "get";
+        status?: "active" | "paused" | "complete" | undefined;
+        objective?: string | undefined;
+        token_budget?: number | undefined;
+    }, options: ai.ToolExecutionOptions) => PromiseLike<string>;
+};
+declare function userInputTool(opts: Pick<ToolOptions, 'requestInput'>): ai.Tool<z.ZodObject<{
+    questions: z.ZodArray<z.ZodObject<{
+        id: z.ZodString;
+        header: z.ZodString;
+        question: z.ZodString;
+        options: z.ZodOptional<z.ZodArray<z.ZodObject<{
+            label: z.ZodString;
+            description: z.ZodString;
+        }, "strip", z.ZodTypeAny, {
+            description: string;
+            label: string;
+        }, {
+            description: string;
+            label: string;
+        }>, "many">>;
+    }, "strip", z.ZodTypeAny, {
+        id: string;
+        header: string;
+        question: string;
+        options?: {
+            description: string;
+            label: string;
+        }[] | undefined;
+    }, {
+        id: string;
+        header: string;
+        question: string;
+        options?: {
+            description: string;
+            label: string;
+        }[] | undefined;
+    }>, "many">;
+}, "strip", z.ZodTypeAny, {
+    questions: {
+        id: string;
+        header: string;
+        question: string;
+        options?: {
+            description: string;
+            label: string;
+        }[] | undefined;
+    }[];
+}, {
+    questions: {
+        id: string;
+        header: string;
+        question: string;
+        options?: {
+            description: string;
+            label: string;
+        }[] | undefined;
+    }[];
+}>, string> & {
+    execute: (args: {
+        questions: {
+            id: string;
+            header: string;
+            question: string;
+            options?: {
+                description: string;
+                label: string;
+            }[] | undefined;
+        }[];
+    }, options: ai.ToolExecutionOptions) => PromiseLike<string>;
+};
+declare function viewImageTool(opts: Pick<ToolOptions, 'cwd'>): ai.Tool<z.ZodObject<{
+    path: z.ZodString;
+}, "strip", z.ZodTypeAny, {
+    path: string;
+}, {
+    path: string;
+}>, string> & {
+    execute: (args: {
+        path: string;
+    }, options: ai.ToolExecutionOptions) => PromiseLike<string>;
+};
+
+/**
+ * Approval gate for tool execution.
+ *
+ * Provides a factory that creates an `ApproveFn` wired to the chat UI's
+ * approval block system. When a tool needs approval, it sends a block
+ * message to the chat thread and awaits the user's decision.
+ *
+ * The service layer stays UI-agnostic — the `ApproveFn` is injected by
+ * the action/flow layer that owns the chat thread.
+ */
+
+interface ChatService {
+    sendBlockMessage(opts: {
+        threadId: string;
+        text: string;
+        blocks: Array<{
+            type: string;
+            props: Record<string, unknown>;
+        }>;
+        forkable?: boolean;
+    }): {
+        messageId: string;
+        response: Promise<unknown>;
+    };
+}
+interface ChatApproverOptions {
+    /** Chat service for sending approval blocks. */
+    chat: ChatService;
+    /** Thread ID to send approval blocks to. */
+    threadId: string;
+    /** Called when the tool is waiting for approval (e.g. to pause stream indicators). */
+    onPause?: () => void;
+    /** Called when approval is received (e.g. to resume stream indicators). */
+    onResume?: () => void;
+}
+/**
+ * Create an `ApproveFn` that sends approval blocks to the chat UI.
+ *
+ * Usage:
+ * ```ts
+ * const approve = createChatApprover({ chat: services.chat, threadId })
+ * const tools = codingAgentTools({ cwd: '/project', approve })
+ * ```
+ */
+declare function createChatApprover(opts: ChatApproverOptions): ApproveFn;
+
+/**
+ * Tool presets — pre-assembled tool sets for common agent patterns.
+ */
+
+/**
+ * Standard tool set for coding agents.
+ *
+ * Includes file operations, shell execution, search, planning, goals,
+ * image viewing, and web search. Mutating tools (shell, write, patch)
+ * use the provided `approve` callback. User input tool is only included
+ * if `requestInput` is provided.
+ */
+declare function codingAgentTools(opts: ToolOptions): ToolSet;
+
+interface CodexSessionInfo {
+    id: string;
+    file: string;
+    cwd?: string;
+    title?: string;
+    modifiedAt: Date;
+    size: number;
+    provider: 'codex';
+}
+/** List all Codex sessions across all date directories. */
+declare function listAll(opts?: {
+    limit?: number;
+}): Promise<CodexSessionInfo[]>;
+/** Parse a Codex JSONL file into an array of entries. */
+declare function viewByFile(filePath: string, opts?: {
+    limit?: number;
+    offset?: number;
+}): Promise<any[]>;
+
+/**
+ * Type definitions for the Codex app-server integration.
+ *
+ * The app-server uses JSON-RPC 2.0 (jsonrpc field omitted on wire)
+ * over JSONL on stdin/stdout. Three message types on the wire:
+ * 1. Responses to our requests (id, result/error, no method)
+ * 2. Server-initiated requests (id AND method) — approval requests
+ * 3. Notifications (method, no id) — streaming events
+ */
+type ServerStatus = 'stopped' | 'starting' | 'ready' | 'error';
+type ApprovalDecision = 'accept' | 'acceptForSession' | 'decline' | 'cancel';
+interface ThreadStartParams {
+    cwd?: string;
+    model?: string;
+    sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access';
+    approvalsReviewer?: 'user' | 'auto_review';
+}
+interface ThreadReadParams {
+    includeTurns?: boolean;
+}
+interface ThreadForkParams extends ThreadStartParams {
+    threadId: string;
+}
+interface ThreadRollbackParams {
+    threadId: string;
+    numTurns: number;
+}
+interface ThreadListParams {
+    cursor?: string | null;
+    limit?: number | null;
+    sortKey?: string | null;
+    sortDirection?: 'asc' | 'desc' | null;
+    modelProviders?: string[] | null;
+    sourceKinds?: string[] | null;
+    archived?: boolean | null;
+    cwd?: string | string[] | null;
+    useStateDbOnly?: boolean;
+    searchTerm?: string | null;
+}
+interface ConfigReadParams {
+    includeLayers: boolean;
+    cwd?: string | null;
+}
+interface ConfigValueWriteParams {
+    keyPath: string;
+    value: any;
+    mergeStrategy?: 'replace' | 'upsert';
+    filePath?: string | null;
+    expectedVersion?: string | null;
+}
+interface TurnStartParams {
+    threadId: string;
+    input: Array<{
+        type: 'text';
+        text: string;
+    }>;
+    cwd?: string;
+    collaborationMode?: {
+        mode: 'plan' | 'code' | 'execute' | 'default' | 'custom' | 'pair_programming';
+        settings: {
+            model?: string;
+            developer_instructions?: string | null;
+        };
+    };
+    approvalsReviewer?: 'user' | 'auto_review';
+    model?: string;
+}
+interface ConsumerHandlers {
+    /** Called for streaming notifications (item/started, item/completed, item/agentMessage/delta, turn/completed, etc.) */
+    onNotification(method: string, params: any): void;
+    /** Called for server-initiated approval requests. Response sent separately via respondToApproval. */
+    onApproval(method: string, requestId: number, params: any): void;
+    /** Called when the app-server process exits unexpectedly. Consumer should clean up thread state. */
+    onCrash?(error: string): void;
+}
+interface CodexTurnHandle {
+    /** Codex app-server thread ID */
+    codexThreadId: string;
+    /** Active turn ID */
+    turnId: string;
+    /** Interrupt the running turn */
+    abort(): Promise<void>;
+}
+
+/** Per-thread handle store for active Codex turns. Callers must call clearHandle on completion. */
+
+declare function storeHandle(key: string, handle: CodexTurnHandle): void;
+declare function getHandle(key: string): CodexTurnHandle | undefined;
+declare function clearHandle(key: string): void;
 
 interface FileEntry {
     name: string;
@@ -146,7 +705,10 @@ declare namespace EARS {
         Settings = "Settings",
         FAQ = "FAQ",
         Secret = "Secret",
-        Note = "Note"
+        Note = "Note",
+        BrowserTab = "BrowserTab",
+        BrowserBookmark = "BrowserBookmark",
+        CalendarEvent = "CalendarEvent"
     }
     export type EntityId = `${Entity}-${string}`;
     const RelKindValues: {
@@ -231,34 +793,374 @@ interface BaseEntity {
     updatedAt?: number;
 }
 
+type SystemEvents = {
+    type: 'CLIENT_CONNECTED';
+};
+
+type BrowserTabId = `${EARS.Entity.BrowserTab}-${string}`;
+interface SavedTab {
+    id: BrowserTabId;
+    url: string;
+    title: string;
+    favicon: string;
+    displayOrder: number;
+    isMuted: boolean;
+    groupId?: string;
+}
+interface SavedBookmark {
+    url: string;
+    title: string;
+    favicon: string;
+    displayOrder: number;
+}
+
+interface BrowserContext {
+}
+
+interface AgentPhase {
+    id: string;
+    name: string;
+    description: string;
+    color?: string;
+}
+interface AgentMode {
+    id: string;
+    name: string;
+    description: string;
+    phases?: AgentPhase[];
+    hidden?: boolean;
+    disabled?: boolean;
+}
+interface QuickPrompt {
+    id: string;
+    text: string;
+}
+interface CommandItem {
+    name: string;
+    placeholder: string;
+}
+type SETTINGS_SCOPE = 'general' | 'plugin' | 'internal';
+interface SettingsData {
+    general: GeneralSettings;
+    plugins: PluginSettings;
+    internal: InternalSettings;
+    assistant: AssistantSettings;
+}
+interface GeneralSettings {
+    personal: PersonalInfo;
+    secrets: Secrets;
+    application: AppSettings;
+    projects: Project[];
+}
+interface Address {
+    street: string;
+    street2?: string;
+    city: string;
+    state: string;
+    postalCode: string;
+    country: string;
+}
+interface PersonalInfo {
+    name?: string;
+    phoneNumber?: string;
+    address?: string | Address;
+}
+interface Secrets {
+    google?: string | null;
+    anthropic?: string | null;
+    openai?: string | null;
+    groq?: string | null;
+    mistral?: string | null;
+    cohere?: string | null;
+    custom?: Record<string, string>;
+    required: string[];
+    cliPaths?: Record<string, string>;
+}
+interface KeyboardShortcut {
+    key: string;
+    modifiers: string[];
+    global?: boolean;
+}
+interface CustomHotkey extends KeyboardShortcut {
+    id: string;
+    eventName: string;
+}
+interface ApplicationHotkeys {
+    switchPluginUp?: KeyboardShortcut;
+    switchPluginDown?: KeyboardShortcut;
+    toggleInspectionPanel?: KeyboardShortcut;
+    custom?: CustomHotkey[];
+}
+interface AppSettings {
+    hotkeys: ApplicationHotkeys;
+    openLinksInApp: boolean;
+}
+interface Project {
+    name: string;
+    directories: string[];
+    color: string;
+}
+interface PluginVisibilitySettings {
+    [pluginId: string]: boolean;
+}
+interface Category {
+    name: string;
+    color: string;
+}
+interface ThreadStatusOption {
+    label: string;
+    color: string;
+}
+interface ThreadTagOption {
+    name: string;
+    color?: string;
+}
+interface ChatStateConfig {
+    id: string;
+    label: string;
+    color: string;
+    busy: boolean;
+}
+interface ThreadsSettings {
+    statuses: ThreadStatusOption[];
+    tags: ThreadTagOption[];
+    chatStates: ChatStateConfig[];
+    showOnlyRootThreads: boolean;
+    clickToChat: boolean;
+    recentThreadsLimit: number;
+    recentThreadsSortOrder: 'created' | 'visited' | 'message';
+    recordingLimitMinutes: number;
+    skipArchiveConfirm?: boolean;
+    chat?: AgentSettings;
+}
+interface NotesSettings {
+    tasklistPanelPosition: 'left' | 'right';
+    showCollapseIcon: boolean;
+}
+interface LogsSettings {
+    maxLogs: number;
+    excludedSources: string[];
+    showAppEvents?: boolean;
+}
+interface PluginSettings {
+    _meta?: {
+        visibility?: PluginVisibilitySettings;
+        lastActivePlugin?: string;
+    };
+    [pluginId: string]: any;
+}
+interface InternalSettings {
+    hasOnboarded: boolean;
+    lastInteractionTimestamp: number | null;
+    version: string;
+    seedHash: string | null;
+}
+interface AssistantSettings {
+    name: string;
+    birthdate: string | null;
+}
+interface FAQItem {
+    id: string;
+    question: string;
+    answer: string;
+    category?: string;
+    order?: number;
+}
+interface AgentSettings {
+    modes: AgentMode[];
+    hotkeys: {
+        textToSpeech?: KeyboardShortcut | null;
+        switchMode?: KeyboardShortcut | null;
+        [key: string]: KeyboardShortcut | null | undefined;
+    };
+    quickPrompts?: QuickPrompt[];
+    quickPromptNumberKeyInserts?: boolean;
+    skipRevertConfirm?: boolean;
+    defaultMode?: string;
+    defaultPhase?: string;
+}
+
 /**
- * Hermes management system types — events and data shapes.
+ * Prompt template types and definitions
  */
 
-interface HermesConnectedData {
-    bridge: BridgeInfo;
-    skills: HermesSkill[];
-    models: HermesModel[];
-    tools: {
-        tools: HermesTool[];
-        enabledToolsets: string[];
-    };
-    persona: {
-        content: string;
-        path: string;
-    };
-    memory: HermesMemoryFiles;
-    workspaces: string[];
-    sessions: HermesSession[];
+/**
+ * Defines an input parameter that a prompt template expects
+ */
+interface TemplateInput {
+    name: string;
+    type: 'string' | 'number' | 'boolean' | 'object' | 'array' | 'any';
+    description?: string;
+    required?: boolean;
+    defaultValue?: any;
+    commonSources?: string[];
+    example?: any;
+}
+/**
+ * Defines a prompt entity stored in the system
+ */
+interface PromptEntity extends BaseEntity {
+    entityType: EARS.Entity.Prompt;
+    label: string;
+    description?: string;
+    category?: string;
+    inputs: Record<string, TemplateInput>;
+    templateFn: string;
+    outputSchema?: any;
+    /** SHA256 hash of DSL source at last seed. Absent on user-created prompts. */
+    sourceHash?: string;
+    createdAt: number;
+    updatedAt: number;
+}
+/**
+ * Data sent on prompts system connection
+ */
+interface PromptsConnectedData {
+    prompts: PromptEntity[];
+    page: number;
+    totalPages: number;
+    totalCount: number;
+    categories?: Category[];
 }
 
-type TokenSource = 'GITHUB_TOKEN' | 'keyring' | 'unknown';
-type TokenKind = 'fine-grained-pat' | 'classic-pat' | 'oauth' | 'unknown';
-interface ActiveTokenInfo {
-    source: TokenSource;
-    kind: TokenKind;
-    prefix: string;
+type IncomingPromptsEvents = {
+    type: 'codePrompts.OPEN_PROMPT';
+    promptId: string;
+} | {
+    type: 'codePrompts.SAVE_PROMPT';
+    promptId: string;
+    templateFn: string;
+};
+
+interface ActionParameter {
+    type: 'string' | 'number' | 'boolean' | 'object' | 'array' | 'any';
+    description?: string;
+    required?: boolean;
+    default?: any;
+    placeholder?: string;
 }
+interface ActionEntity {
+    id: EARS.EntityId;
+    entityType: EARS.Entity.Action;
+    label: string;
+    description?: string;
+    category?: string;
+    input: Record<string, ActionParameter>;
+    actionFn: string;
+    output?: any;
+    /** SHA256 hash of DSL source at last seed. Absent on user-created actions. */
+    sourceHash?: string;
+    createdAt: number;
+    updatedAt: number;
+}
+interface ActionsStartupData {
+    actions: ActionEntity[];
+    page: number;
+    totalPages: number;
+    totalCount: number;
+    categories?: Category[];
+}
+
+type IncomingActionsEvents = {
+    type: 'codeActions.OPEN_ACTION';
+    actionId: string;
+} | {
+    type: 'codeActions.SAVE_ACTION';
+    actionId: string;
+    actionFn: string;
+};
+type OutgoingActionsEvents = {
+    type: 'codeActions.ACTION_SELECTED';
+    actionId: string;
+    data: ActionEntity & {
+        actionFnContent?: string;
+    };
+} | {
+    type: 'codeActions.ACTION_UPDATED';
+    action: ActionEntity;
+    actionId: string;
+} | {
+    type: 'codeActions.CODE_ERROR';
+    data: {
+        message: string;
+    };
+};
+
+type IncomingTerminalEvents = {
+    type: 'terminal.CREATE_TERMINAL';
+    title?: string;
+    cwd?: string;
+    shell?: string;
+    cols?: number;
+    rows?: number;
+} | {
+    type: 'terminal.CLOSE_TERMINAL';
+    terminalId: string;
+} | {
+    type: 'terminal.TERMINAL_INPUT';
+    terminalId: string;
+    data: string;
+} | {
+    type: 'terminal.RESIZE_TERMINAL';
+    terminalId: string;
+    cols: number;
+    rows: number;
+} | {
+    type: 'terminal.RENAME_TERMINAL';
+    terminalId: string;
+    customTitle: string;
+} | {
+    type: 'terminal.REFRESH_LIST';
+} | {
+    type: 'terminal.OPEN_TERMINAL_TAB';
+    terminalId: string;
+};
+type OutgoingTerminalEvents = {
+    type: 'terminal.CREATED';
+    data: TerminalInfo;
+} | {
+    type: 'terminal.OUTPUT';
+    data: {
+        terminalId: string;
+        data: string;
+    };
+} | {
+    type: 'terminal.INITIAL_OUTPUT';
+    data: {
+        terminalId: string;
+        data: string;
+    };
+} | {
+    type: 'terminal.CLOSED';
+    data: {
+        terminalId: string;
+    };
+} | {
+    type: 'terminal.RENAMED';
+    data: {
+        terminalId: string;
+        customTitle: string;
+    };
+} | {
+    type: 'terminal.CWD_CHANGED';
+    data: {
+        terminalId: string;
+        cwd: string;
+        title?: string;
+    };
+} | {
+    type: 'terminal.ERROR';
+    data: {
+        message: string;
+        terminalId?: string;
+    };
+} | {
+    type: 'terminal.TERMINALS_LISTED';
+    data: TerminalInfo[];
+} | {
+    type: 'terminal.TERMINAL_TAB_OPENED';
+    data: TerminalInfo;
+};
 
 declare class GitRepository {
     private workingDirectory;
@@ -362,7 +1264,7 @@ declare class GitRepository {
         ahead: number;
         behind: number;
     }>;
-    pushBranch(branchName?: string): Promise<void>;
+    pushBranch(): Promise<void>;
     pullBranch(): Promise<void>;
     stashPush(message?: string, stagedOnly?: boolean): Promise<string>;
     stashList(): Promise<StashEntry[]>;
@@ -380,1173 +1282,16 @@ declare class GitRepository {
     }[]>;
     gitLog(count?: number): Promise<CommitLogEntry[]>;
     revertCommit(hash: string): Promise<void>;
-    resetToCommit(hash: string, mode?: 'soft' | 'mixed' | 'hard'): Promise<void>;
+    resetToCommit(hash: string): Promise<void>;
 }
 
-interface FileChangeInfo {
-    path: string;
-    modifiedAt: Date;
-    changeType: 'add' | 'change' | 'unlink';
+type TokenSource = 'GITHUB_TOKEN' | 'keyring' | 'unknown';
+type TokenKind = 'fine-grained-pat' | 'classic-pat' | 'oauth' | 'unknown';
+interface ActiveTokenInfo {
+    source: TokenSource;
+    kind: TokenKind;
+    prefix: string;
 }
-declare class GitWatcherService {
-    private workingDirectory;
-    private gitWatcher?;
-    private workingDirWatcher?;
-    private onGitChangeCallback?;
-    private onFileChangeCallback?;
-    private gitStatusDebounceTimeout?;
-    private fileChangeTimeouts;
-    private isWatching;
-    private openFiles;
-    private gitRepository?;
-    constructor(workingDirectory: string);
-    setGitRepository(repo: GitRepository): void;
-    setChangeCallback(callback: () => void): void;
-    setFileChangeCallback(callback: (change: FileChangeInfo) => void): void;
-    registerOpenFile(filePath: string): void;
-    unregisterOpenFile(filePath: string): void;
-    isFileOpen(filePath: string): boolean;
-    getOpenFiles(): string[];
-    startWatching(): Promise<void>;
-    private handleFileChange;
-    stopWatching(): Promise<void>;
-    isActive(): boolean;
-}
-
-/**
- * Database Seed — loads compiled default-setup artifacts into LMDB
- *
- * Skips seeding if the compiled data hash is unchanged since last seed,
- * unless `force` is passed. The CLI script always forces.
- */
-interface SeedCounts {
-    created: number;
-    updated: number;
-    skipped: number;
-}
-interface SeedResult {
-    actions: SeedCounts;
-    prompts: SeedCounts;
-    flows: SeedCounts;
-    library: SeedCounts;
-    notes: SeedCounts;
-    settings: SeedCounts;
-}
-
-interface SecretEntity {
-    id: EARS.EntityId;
-    entityType: EARS.Entity.Secret;
-    provider: SecretProvider;
-    encryptedValue: string;
-    customName?: string;
-    createdAt: number;
-    updatedAt?: number;
-}
-type SecretProvider = 'google' | 'anthropic' | 'openai' | 'groq' | 'mistral' | 'cohere' | 'custom';
-interface CreateSecretParams {
-    provider: SecretProvider;
-    value: string;
-    customName?: string;
-}
-interface SecretData {
-    id: EARS.EntityId;
-    provider: SecretProvider;
-    customName?: string;
-    createdAt: number;
-    updatedAt?: number;
-}
-
-interface NoteEntity extends BaseEntity {
-    entityType: EARS.Entity.Note;
-    title: string;
-    content: string;
-    icon: string | null;
-    noteType: 'document' | 'tasklist' | 'task';
-    completed: boolean;
-    hideCompletedChildren: boolean;
-    displayOrder: number;
-    savedDisplayOrder?: number;
-    createdAt: number;
-    updatedAt: number;
-    lastSeen: number;
-    favorite?: boolean;
-    deleted?: boolean;
-    deletedAt?: number;
-}
-interface NoteDTO {
-    id: string;
-    title: string;
-    content: string;
-    icon: string | null;
-    noteType: 'document' | 'tasklist' | 'task';
-    completed: boolean;
-    hideCompletedChildren: boolean;
-    parentId: string | null;
-    displayOrder: number;
-    savedDisplayOrder: number | null;
-    childCount: number;
-    createdAt: number;
-    updatedAt: number;
-    lastSeen: number;
-    favorite: boolean;
-    deletedAt?: number;
-}
-type OutgoingNotesSearchEvent = {
-    type: 'NOTES_SEARCH_RESULTS';
-    results: NoteDTO[];
-};
-interface NotesConnectedData {
-    notes: NoteDTO[];
-    settings?: NotesSettings;
-}
-
-type OutgoingNotesEvents = {
-    type: 'NOTES_CONNECTED';
-    data: NotesConnectedData;
-} | {
-    type: 'NOTE_CREATED';
-    note: NoteDTO;
-} | {
-    type: 'NOTE_UPDATED';
-    note: NoteDTO;
-} | {
-    type: 'NOTE_DELETED';
-    noteId: string;
-} | {
-    type: 'NOTE_RESTORED';
-    note: NoteDTO;
-} | {
-    type: 'TRASHED_NOTES';
-    notes: NoteDTO[];
-} | OutgoingNotesSearchEvent | {
-    type: 'NOTES_IMPORTED';
-    count: number;
-    errors?: string[];
-} | {
-    type: 'NOTES_IMPORT_FAILED';
-    errors: string[];
-} | {
-    type: 'NOTES_EXPORTED';
-    filePath: string;
-    itemCount: number;
-} | {
-    type: 'NOTES_EXPORT_FAILED';
-    errors: string[];
-};
-
-type DocumentShortCode = `DOC-${number}`;
-interface FieldContent {
-    type: 'field';
-    fields: Array<{
-        key: string;
-        value: string;
-    }>;
-}
-interface ListContent {
-    type: 'list';
-    items: string[];
-}
-interface MarkdownContent {
-    type: 'markdown';
-    text: string;
-}
-interface TextContent {
-    type: 'text';
-    text: string;
-}
-interface CodeContent {
-    type: 'code';
-    text: string;
-    language: string;
-}
-type ContentSection = FieldContent | ListContent | MarkdownContent | TextContent | CodeContent;
-interface DocumentDTO {
-    id: EARS.EntityId;
-    name: string;
-    content: ContentSection[];
-    shortCode: DocumentShortCode;
-    tags: string[];
-    collectionId?: EARS.EntityId;
-    collectionPath?: string[];
-    displayOrder: number;
-    createdAt: string;
-    updatedAt: string;
-}
-interface CollectionDTO {
-    id: EARS.EntityId;
-    name: string;
-    description?: string;
-    parentId?: EARS.EntityId;
-    path: string[];
-    documentCount: number;
-    childCollections: CollectionDTO[];
-    displayOrder: number;
-    createdAt: string;
-    updatedAt: string;
-    symlinkPath?: string;
-}
-interface FolderItem {
-    type: 'folder';
-    id: EARS.EntityId;
-    name: string;
-    parentId: EARS.EntityId | null;
-    childCount: number;
-    size: string;
-    kind: 'Folder';
-    displayOrder: number;
-    createdAt: string;
-    updatedAt: string;
-    isSymlink?: boolean;
-    symlinkPath?: string;
-    isSymlinked?: boolean;
-    isBroken?: boolean;
-}
-interface DocumentItem {
-    type: 'document';
-    id: EARS.EntityId;
-    name: string;
-    shortCode: DocumentShortCode;
-    parentId: EARS.EntityId | null;
-    content: ContentSection[];
-    tags: string[];
-    size: string;
-    kind: 'Document';
-    displayOrder: number;
-    createdAt: string;
-    updatedAt: string;
-    isSymlinked?: boolean;
-    filePath?: string;
-}
-type LibraryItem = FolderItem | DocumentItem;
-interface FolderContents {
-    items: LibraryItem[];
-    currentPath: string[];
-    currentFolderId: EARS.EntityId | null;
-    breadcrumbs: BreadcrumbItem[];
-    searchIndices?: any[];
-    isBroken?: boolean;
-    lastKnownPath?: string;
-}
-interface BreadcrumbItem {
-    id: EARS.EntityId | null;
-    name: string;
-    path: string[];
-}
-interface LibrarySystemContext {
-    documents: DocumentDTO[];
-    collections: CollectionDTO[];
-    selectedDocumentId?: EARS.EntityId;
-    selectedCollectionId?: EARS.EntityId;
-    currentItems: LibraryItem[];
-    currentFolderId: EARS.EntityId | null;
-    currentPath: string[];
-}
-
-type OutgoingLibraryEvents = {
-    type: 'LIBRARY_CONNECTED';
-    data: {
-        documents: DocumentDTO[];
-        collections: CollectionDTO[];
-        settings: any;
-    };
-} | {
-    type: 'DOCUMENTS_LOADED';
-    data: {
-        documents: DocumentDTO[];
-    };
-} | {
-    type: 'DOCUMENT_CREATED';
-    data: {
-        document: DocumentDTO;
-    };
-} | {
-    type: 'DOCUMENT_UPDATED';
-    data: {
-        document: DocumentDTO;
-    };
-} | {
-    type: 'DOCUMENT_DELETED';
-    data: {
-        documentId: string;
-    };
-} | {
-    type: 'DOCUMENT_LOADED';
-    data: {
-        document: DocumentDTO;
-    };
-} | {
-    type: 'COLLECTIONS_LOADED';
-    data: {
-        collections: CollectionDTO[];
-    };
-} | {
-    type: 'COLLECTION_CREATED';
-    data: {
-        collection: CollectionDTO;
-    };
-} | {
-    type: 'COLLECTION_UPDATED';
-    data: {
-        collection: CollectionDTO;
-    };
-} | {
-    type: 'COLLECTION_DELETED';
-    data: {
-        collectionId: string;
-    };
-} | {
-    type: 'LIBRARY_ERROR';
-    data: {
-        error: string;
-    };
-} | {
-    type: 'SYMLINK_UPDATED';
-    data: {
-        collection: CollectionDTO;
-    };
-} | {
-    type: 'FOLDER_CONTENTS_LOADED';
-    data: FolderContents;
-} | {
-    type: 'NAVIGATION_CHANGED';
-    data: {
-        folderId: string | null;
-        path: string[];
-    };
-} | {
-    type: 'ITEM_RENAMED';
-    data: {
-        item: LibraryItem;
-    };
-} | {
-    type: 'ITEMS_DELETED';
-    data: {
-        ids: string[];
-    };
-} | {
-    type: 'ITEMS_MOVED';
-    data: {
-        ids: string[];
-        targetFolderId: string | null;
-    };
-} | {
-    type: 'LIBRARY_IMPORTED';
-    count: number;
-    errors?: string[];
-} | {
-    type: 'LIBRARY_IMPORT_FAILED';
-    errors: string[];
-} | {
-    type: 'LIBRARY_EXPORTED';
-    filePath: string;
-    itemCount: number;
-} | {
-    type: 'LIBRARY_EXPORT_FAILED';
-    errors: string[];
-};
-
-interface ActionParameter {
-    type: 'string' | 'number' | 'boolean' | 'object' | 'array' | 'any';
-    description?: string;
-    required?: boolean;
-    default?: any;
-    placeholder?: string;
-}
-interface ActionEntity {
-    id: EARS.EntityId;
-    entityType: EARS.Entity.Action;
-    label: string;
-    description?: string;
-    category?: string;
-    input: Record<string, ActionParameter>;
-    actionFn: string;
-    output?: any;
-    /** SHA256 hash of DSL source at last seed. Absent on user-created actions. */
-    sourceHash?: string;
-    createdAt: number;
-    updatedAt: number;
-}
-interface ActionsStartupData {
-    actions: ActionEntity[];
-    page: number;
-    totalPages: number;
-    totalCount: number;
-    categories?: Category[];
-}
-
-type OutgoingActionEvents = {
-    type: 'ACTIONS_LISTED';
-    data: ActionsStartupData;
-} | {
-    type: 'ACTION_SELECTED';
-    actionId: EARS.EntityId;
-    data: ActionEntity;
-} | {
-    type: 'ACTION_CREATED';
-    action: ActionEntity;
-    actionId: EARS.EntityId;
-} | {
-    type: 'ACTION_UPDATED';
-    action: ActionEntity;
-    actionId: EARS.EntityId;
-} | {
-    type: 'ACTION_DELETED';
-    actionId: EARS.EntityId;
-} | {
-    type: 'ACTIONS_PAGE_LOADED';
-    data: {
-        actions: ActionEntity[];
-        page: number;
-        totalPages: number;
-    };
-} | {
-    type: 'ACTIONS_ALL_LOADED';
-    data: {
-        actions: ActionEntity[];
-    };
-} | {
-    type: 'ACTIONS_IMPORTED';
-    count: number;
-    errors?: string[];
-} | {
-    type: 'ACTIONS_IMPORT_FAILED';
-    errors: string[];
-} | {
-    type: 'ACTIONS_EXPORTED';
-    filePath: string;
-    actionCount: number;
-} | {
-    type: 'ACTIONS_EXPORT_FAILED';
-    errors: string[];
-};
-
-/**
- * Prompt template types and definitions
- */
-
-/**
- * Defines an input parameter that a prompt template expects
- */
-interface TemplateInput {
-    name: string;
-    type: 'string' | 'number' | 'boolean' | 'object' | 'array' | 'any';
-    description?: string;
-    required?: boolean;
-    defaultValue?: any;
-    commonSources?: string[];
-    example?: any;
-}
-/**
- * Defines a prompt entity stored in the system
- */
-interface PromptEntity extends BaseEntity {
-    entityType: EARS.Entity.Prompt;
-    label: string;
-    description?: string;
-    category?: string;
-    inputs: Record<string, TemplateInput>;
-    templateFn: string;
-    outputSchema?: any;
-    /** SHA256 hash of DSL source at last seed. Absent on user-created prompts. */
-    sourceHash?: string;
-    createdAt: number;
-    updatedAt: number;
-}
-/**
- * Data sent on prompts system connection
- */
-interface PromptsConnectedData {
-    prompts: PromptEntity[];
-    page: number;
-    totalPages: number;
-    totalCount: number;
-    categories?: Category[];
-}
-
-type OutgoingPromptEvents = {
-    type: 'PROMPTS_CONNECTED';
-    data: PromptsConnectedData;
-} | {
-    type: 'PROMPT_SELECTED';
-    promptId: EARS.EntityId;
-    data: PromptEntity;
-} | {
-    type: 'PROMPT_CREATED';
-    prompt: PromptEntity;
-    promptId: EARS.EntityId;
-} | {
-    type: 'PROMPT_UPDATED';
-    prompt: PromptEntity;
-    promptId: EARS.EntityId;
-} | {
-    type: 'PROMPT_DELETED';
-    promptId: EARS.EntityId;
-} | {
-    type: 'PROMPTS_PAGE_LOADED';
-    data: {
-        prompts: PromptEntity[];
-        page: number;
-        totalPages: number;
-    };
-} | {
-    type: 'PROMPTS_ALL_LOADED';
-    data: {
-        prompts: PromptEntity[];
-    };
-} | {
-    type: 'PROMPTS_IMPORTED';
-    count: number;
-    errors?: string[];
-} | {
-    type: 'PROMPTS_IMPORT_FAILED';
-    errors: string[];
-} | {
-    type: 'PROMPTS_EXPORTED';
-    filePath: string;
-    promptCount: number;
-} | {
-    type: 'PROMPTS_EXPORT_FAILED';
-    errors: string[];
-};
-
-declare const LogLevel: z.ZodEnum<["debug", "info", "warn", "error"]>;
-type LogLevel = z.infer<typeof LogLevel>;
-declare const LogEntry: z.ZodObject<{
-    id: z.ZodString;
-    timestamp: z.ZodNumber;
-    level: z.ZodEnum<["debug", "info", "warn", "error"]>;
-    message: z.ZodString;
-    source: z.ZodOptional<z.ZodString>;
-    meta: z.ZodOptional<z.ZodRecord<z.ZodString, z.ZodAny>>;
-    stack: z.ZodOptional<z.ZodString>;
-}, "strip", z.ZodTypeAny, {
-    id: string;
-    timestamp: number;
-    message: string;
-    level: "error" | "debug" | "info" | "warn";
-    meta?: Record<string, any> | undefined;
-    source?: string | undefined;
-    stack?: string | undefined;
-}, {
-    id: string;
-    timestamp: number;
-    message: string;
-    level: "error" | "debug" | "info" | "warn";
-    meta?: Record<string, any> | undefined;
-    source?: string | undefined;
-    stack?: string | undefined;
-}>;
-type LogEntry = z.infer<typeof LogEntry>;
-
-type OutgoingLogsEvents = {
-    type: 'LOGS_CONNECTED';
-    logs: LogEntry[];
-    settings?: LogsSettings;
-} | {
-    type: 'LOGS_UPDATE';
-    logs: LogEntry[];
-} | {
-    type: 'LOG_ADDED';
-    log: LogEntry;
-} | {
-    type: 'LOGS_CLEARED';
-} | {
-    type: 'LOGS_SETTINGS_UPDATED';
-    settings: LogsSettings;
-};
-interface LogsContext {
-    logs: LogEntry[];
-}
-
-interface DatabaseSchemaInfo {
-    entities: Array<{
-        type: EARS.Entity;
-    }>;
-    attributes: Array<{
-        kind: string;
-    }>;
-    relations: Array<{
-        kind: EARS.RelKind;
-    }>;
-}
-interface DatabaseStartupData {
-    schema: DatabaseSchemaInfo;
-}
-
-/** ── Shared aliases ─────────────────────────────────────────────────────── */
-type TimestampMs = number;
-type EntityStatus = 'active' | 'paused' | 'completed' | 'failed';
-type TNodeKind = 'flow' | 'event' | 'step';
-/** ── Core entities ──────────────────────────────────────────────────────── */
-interface TNodeEntity extends BaseEntity {
-    entityType: EARS.Entity.TNode;
-    tNodeType: TNodeKind;
-    label: string;
-    status: EntityStatus;
-    startedAt: TimestampMs;
-    completedAt?: TimestampMs;
-    eventType?: string;
-    stepNodeType?: string;
-    final?: boolean;
-    nodeAttributes?: Record<string, unknown>;
-    resolvedParams?: Record<string, unknown>;
-    blueprint?: {
-        nodeId: EARS.EntityId;
-        flowId: EARS.EntityId;
-    };
-}
-interface TrackEntity extends TNodeEntity {
-    children: TrackEntity[];
-}
-interface EventListenerEntity {
-    id: EARS.EntityId;
-    nodeId: EARS.EntityId;
-    eventType: string;
-    label: string;
-    scope: 'global' | 'local' | 'entry';
-}
-interface FlowTNodeData {
-    flowTNodeId: EARS.EntityId;
-    tNodeTree: TrackEntity[];
-    possibleEvents: EventListenerEntity[];
-    flowHierarchy: Array<{
-        flowTNodeId: EARS.EntityId;
-        label: string;
-    }>;
-}
-interface TNodeUpdate {
-    tNodeId: EARS.EntityId;
-    status: TNodeEntity['status'];
-    eventTNodeId?: EARS.EntityId;
-}
-/** ── Brain runner types ─────────────────────────────────────────────────── */
-interface ExecutionEvent {
-    type: string;
-    data: Record<string, unknown>;
-    timestamp?: TimestampMs;
-    source?: string;
-}
-interface StepRun {
-    id?: string;
-    label: string;
-    result: unknown;
-    timestamp: TimestampMs;
-}
-interface ExecutionContext {
-    flowTNodeId: EARS.EntityId;
-    event: ExecutionEvent;
-    steps: StepRun[];
-    lastStep?: Omit<StepRun, 'timestamp'>;
-}
-
-type OutgoingDatabaseEvents = {
-    type: 'DATABASE_REFRESH';
-    data: DatabaseStartupData;
-} | {
-    type: 'QUERY_RESULT';
-    result: any;
-    executionTime: number;
-} | {
-    type: 'QUERY_ERROR';
-    error: string;
-} | {
-    type: 'TRANSACTION_RESULT';
-    result: any;
-    executionTime: number;
-} | {
-    type: 'TRANSACTION_ERROR';
-    error: string;
-} | {
-    type: 'AI_QUERY_LOADING';
-} | {
-    type: 'AI_QUERY_GENERATED';
-    query: string;
-} | {
-    type: 'TRACE_FLOWS_RESULT';
-    flows: TNodeEntity[];
-} | {
-    type: 'FLOW_EVENTS_RESULT';
-    flowId: string;
-    events: TNodeEntity[];
-    hasMore: boolean;
-} | {
-    type: 'NODE_DETAILS_RESULT';
-    nodeId: string;
-    details: TNodeEntity | null;
-} | {
-    type: 'EXPORT_DATABASE_SUCCESS';
-    path: string;
-} | {
-    type: 'EXPORT_DATABASE_ERROR';
-    error: string;
-} | {
-    type: 'IMPORT_DATABASE_SUCCESS';
-    message?: string;
-} | {
-    type: 'IMPORT_DATABASE_ERROR';
-    error: string;
-} | {
-    type: 'BACKUP_INFO_RESULT';
-    info: {
-        timestamp: number;
-        databases: string[];
-        size: number;
-        hasMedia?: boolean;
-    } | null;
-} | {
-    type: 'RESET_DATABASE_SUCCESS';
-    message: string;
-} | {
-    type: 'RESET_DATABASE_ERROR';
-    error: string;
-};
-
-interface FlowEntity extends BaseEntity {
-    entityType: EARS.Entity.Flow;
-    shortCode: string;
-    label: string;
-    description?: string;
-    flowType: 'workflow' | 'integration';
-    createdAt: number;
-    /** SHA256 hash of the DSL source at last seed. Absent on user-created flows. */
-    sourceHash?: string;
-}
-interface NodeBase extends BaseEntity {
-    entityType: EARS.Entity.Node;
-    /** discriminator */
-    nodeType: NodeKind;
-    label: string;
-    description?: string;
-    color?: string;
-    /** When true, completing this node will trigger parent flow completion */
-    final?: boolean;
-}
-interface QueryNode extends NodeBase {
-    nodeType: 'query';
-    prompt: string;
-    resultKey?: string;
-}
-interface CreateNode extends NodeBase {
-    nodeType: 'create';
-    entityTypeTarget: EARS.Entity;
-    entityId?: string;
-    inferLabel?: boolean;
-}
-interface UpdateNode extends NodeBase {
-    nodeType: 'update';
-    entityId: string;
-    onMissing?: 'fail' | 'ignore' | 'create';
-}
-declare enum BinaryOperator {
-    EQUALS = "equals",
-    NOT_EQUALS = "not_equals",
-    GREATER_THAN = "greater_than",
-    LESS_THAN = "less_than",
-    GREATER_THAN_OR_EQUALS = "greater_than_or_equals",
-    LESS_THAN_OR_EQUALS = "less_than_or_equals",
-    CONTAINS = "contains",
-    STARTS_WITH = "starts_with",
-    ENDS_WITH = "ends_with",
-    MATCHES = "matches",
-    IS_EMPTY = "is_empty",
-    IS_NULL = "is_null"
-}
-type Predicate = {
-    key: string;
-    operator: BinaryOperator;
-    value?: any;
-} | ((context: any) => boolean);
-type Condition = {
-    predicate?: Predicate;
-    label?: string;
-    mode?: 'expression' | 'code';
-    code?: string;
-};
-interface SwitchNode extends NodeBase {
-    nodeType: 'switch';
-    conditions: Array<Condition>;
-    elseLabel?: string;
-}
-interface FireNode extends NodeBase {
-    nodeType: 'fire';
-    eventType: string;
-    payload?: unknown;
-    scope?: 'local' | 'global';
-}
-interface ListenerNode extends NodeBase {
-    nodeType: 'listener';
-    scope: 'global' | 'local' | 'entry';
-    eventType: string;
-    debounceMs?: number;
-}
-interface TransformNode extends NodeBase {
-    nodeType: 'transform';
-    script: string;
-    outputType?: 'json' | 'text' | 'custom';
-}
-interface FlowNode extends NodeBase {
-    nodeType: 'flow';
-    flowRef: string;
-    propagateCtx?: boolean;
-    fieldMappings?: Array<{
-        target: string;
-        source: string;
-        default?: any;
-    }>;
-}
-interface KeepAliveNode extends NodeBase {
-    nodeType: 'keep_alive';
-}
-interface KillNode extends NodeBase {
-    nodeType: 'kill';
-}
-interface LLMNode extends NodeBase {
-    nodeType: 'llm';
-    prompt?: string;
-    promptTemplateId?: string;
-    fieldMappings?: Array<{
-        target: string;
-        source: string;
-        default?: any;
-    }>;
-    model?: string;
-    temperature?: number;
-    maxTokens?: number;
-    systemPrompt?: string;
-}
-interface ActionNode extends NodeBase {
-    nodeType: 'action';
-    mode?: 'template' | 'code';
-    actionId?: string;
-    actionFn?: string;
-    params?: Record<string, any>;
-    fieldMappings?: Array<{
-        target: string;
-        source: string;
-        default?: any;
-    }>;
-}
-type NodeEntity = QueryNode | CreateNode | UpdateNode | ActionNode | SwitchNode | FireNode | ListenerNode | TransformNode | FlowNode | KeepAliveNode | KillNode | LLMNode;
-/** Literal union of all nodeType strings (keeps Base clean) */
-type NodeKind = NodeEntity['nodeType'];
-type NodeCreateInput = Partial<NodeEntity> & {
-    actionId?: string;
-    promptTemplateId?: string;
-};
-type EdgeEntity = {
-    id: EARS.EntityId;
-    kind: EARS.RelKind;
-    source: EARS.EntityId;
-    target: EARS.EntityId;
-    sourceHandle?: string;
-    targetHandle?: string;
-    info?: {
-        [key: string]: any;
-    };
-};
-interface FlowsConnectedData {
-    selectedFlowId: EARS.EntityId;
-    graph: {
-        nodes: NodeEntity[];
-        edges: EdgeEntity[];
-    };
-    flows: Partial<FlowEntity>[];
-    rootFlow?: Partial<FlowEntity>;
-    models: ModelCatalogEntry[];
-    prompts: PromptEntity[];
-    actions: ActionEntity[];
-    settings?: any;
-}
-interface ModelCatalogEntry {
-    id: string;
-    name: string;
-    provider: string;
-    description?: string;
-    contextWindow: number;
-    maxOutput?: number;
-    costPer1kInput?: number;
-    costPer1kOutput?: number;
-    capabilities?: string[];
-}
-interface FlowExtendedData {
-    nodes: NodeEntity[];
-    edges: EdgeEntity[];
-}
-
-type OutgoingFlowsEvents = {
-    type: 'FLOWS_CONNECTED';
-    data: FlowsConnectedData;
-} | {
-    type: 'FLOW_SELECTED';
-    flowId: EARS.EntityId;
-    data: {
-        nodes: any[];
-        edges: any[];
-    };
-} | {
-    type: 'FLOW_CREATED';
-    flow: FlowEntity;
-    flowId: EARS.EntityId;
-    data: {
-        nodes: any[];
-        edges: any[];
-    };
-} | {
-    type: 'FLOW_DELETED';
-    flowId: EARS.EntityId;
-} | {
-    type: 'NODE_CREATED';
-    tempId: string;
-    nodeId: EARS.EntityId;
-    node: any;
-} | {
-    type: 'NODE_UPDATED';
-    nodeId: EARS.EntityId;
-    node: any;
-} | {
-    type: 'NODE_DELETED';
-    nodeId: string;
-} | {
-    type: 'EDGE_CREATED';
-    sourceId: EARS.EntityId;
-    targetId: EARS.EntityId;
-    relId: EARS.EntityId;
-    sourceHandle?: string;
-    targetHandle?: string;
-} | {
-    type: 'EDGE_CREATE_FAILED';
-    sourceId: string;
-    targetId: string;
-    error: string;
-} | {
-    type: 'EDGE_DELETED';
-    edgeId: string;
-} | {
-    type: 'EDGE_UPDATED';
-    oldEdgeId: EARS.EntityId;
-    newEdgeId: EARS.EntityId;
-    newSource: EARS.EntityId;
-    newTarget: EARS.EntityId;
-} | {
-    type: 'ACTION_CREATED';
-    action: ActionEntity;
-    actionId: EARS.EntityId;
-} | {
-    type: 'ACTION_UPDATED';
-    action: ActionEntity;
-    actionId: EARS.EntityId;
-} | {
-    type: 'ACTION_DELETED';
-    actionId: EARS.EntityId;
-} | {
-    type: 'DSL_IMPORTED';
-    flowIds: EARS.EntityId[];
-    errors?: string[];
-} | {
-    type: 'DSL_IMPORT_FAILED';
-    errors: string[];
-} | {
-    type: 'DSL_EXPORTED';
-    filePath: string;
-    flowCount: number;
-} | {
-    type: 'DSL_EXPORT_FAILED';
-    errors: string[];
-};
-
-type SecretsOutputEvents = {
-    type: 'SECRETS.EVENT.LOADED';
-    data: SecretData[];
-} | {
-    type: 'SECRETS.EVENT.CREATED';
-    id: EARS.EntityId;
-    provider: SecretProvider;
-    customName?: string;
-} | {
-    type: 'SECRETS.EVENT.UPDATED';
-    id: EARS.EntityId;
-} | {
-    type: 'SECRETS.EVENT.DELETED';
-    id: EARS.EntityId;
-} | {
-    type: 'SECRETS.EVENT.VALUE';
-    id: EARS.EntityId;
-    value: string;
-} | {
-    type: 'SECRETS.EVENT.ERROR';
-    message: string;
-};
-
-/**
- * Setup Pack Preview — reads compiled artifacts from a directory and
- * reports the top-level items available for selective import.
- */
-type SetupPackType = 'actions' | 'prompts' | 'flows' | 'library' | 'notes' | 'settings';
-type SetupPackItemKind = 'collection' | 'document' | 'tasklist' | 'task';
-interface SetupPackPreviewItem {
-    key: string;
-    description?: string;
-    kind?: SetupPackItemKind;
-    childCount?: number;
-}
-interface SetupPackPreview {
-    directory: string;
-    actions: SetupPackPreviewItem[];
-    prompts: SetupPackPreviewItem[];
-    flows: SetupPackPreviewItem[];
-    library: SetupPackPreviewItem[];
-    notes: SetupPackPreviewItem[];
-    settings: SetupPackPreviewItem[];
-    missing: SetupPackType[];
-}
-
-type OutgoingSettingsEvents = {
-    type: 'SETTINGS_LOADED';
-    data: SettingsData;
-    faqs: FAQItem[];
-} | {
-    type: 'SETTINGS_UPDATED';
-    data: SettingsData;
-} | {
-    type: 'SETTINGS_RESET';
-    data: SettingsData;
-} | {
-    type: 'APPLICATION_HOTKEYS';
-    hotkeys: SettingsData['general']['application']['hotkeys'];
-} | {
-    type: 'CLI_TEST_RESULT';
-    provider: string;
-    success: boolean;
-    error?: string;
-    resolvedPath?: string;
-} | {
-    type: 'SETUP_PACK_IMPORTED';
-    result: SeedResult;
-} | {
-    type: 'SETUP_PACK_IMPORT_FAILED';
-    error: string;
-} | {
-    type: 'SETUP_PACK_PREVIEW';
-    preview: SetupPackPreview;
-} | {
-    type: 'SETUP_PACK_PREVIEW_FAILED';
-    error: string;
-} | {
-    type: 'APP_RESET_COMPLETE';
-} | {
-    type: 'APP_RESET_FAILED';
-    error: string;
-} | SecretsOutputEvents;
-
-type IncomingPromptsEvents = {
-    type: 'codePrompts.OPEN_PROMPT';
-    promptId: string;
-} | {
-    type: 'codePrompts.SAVE_PROMPT';
-    promptId: string;
-    templateFn: string;
-};
-
-type IncomingActionsEvents = {
-    type: 'codeActions.OPEN_ACTION';
-    actionId: string;
-} | {
-    type: 'codeActions.SAVE_ACTION';
-    actionId: string;
-    actionFn: string;
-};
-type OutgoingActionsEvents = {
-    type: 'codeActions.ACTION_SELECTED';
-    actionId: string;
-    data: ActionEntity & {
-        actionFnContent?: string;
-    };
-} | {
-    type: 'codeActions.ACTION_UPDATED';
-    action: ActionEntity;
-    actionId: string;
-} | {
-    type: 'codeActions.CODE_ERROR';
-    data: {
-        message: string;
-    };
-};
-
-type IncomingTerminalEvents = {
-    type: 'terminal.CREATE_TERMINAL';
-    title?: string;
-    cwd?: string;
-    shell?: string;
-    cols?: number;
-    rows?: number;
-} | {
-    type: 'terminal.CLOSE_TERMINAL';
-    terminalId: string;
-} | {
-    type: 'terminal.TERMINAL_INPUT';
-    terminalId: string;
-    data: string;
-} | {
-    type: 'terminal.RESIZE_TERMINAL';
-    terminalId: string;
-    cols: number;
-    rows: number;
-} | {
-    type: 'terminal.RENAME_TERMINAL';
-    terminalId: string;
-    customTitle: string;
-} | {
-    type: 'terminal.REFRESH_LIST';
-} | {
-    type: 'terminal.OPEN_TERMINAL_TAB';
-    terminalId: string;
-};
-type OutgoingTerminalEvents = {
-    type: 'terminal.CREATED';
-    data: TerminalInfo;
-} | {
-    type: 'terminal.OUTPUT';
-    data: {
-        terminalId: string;
-        data: string;
-    };
-} | {
-    type: 'terminal.INITIAL_OUTPUT';
-    data: {
-        terminalId: string;
-        data: string;
-    };
-} | {
-    type: 'terminal.CLOSED';
-    data: {
-        terminalId: string;
-    };
-} | {
-    type: 'terminal.RENAMED';
-    data: {
-        terminalId: string;
-        customTitle: string;
-    };
-} | {
-    type: 'terminal.CWD_CHANGED';
-    data: {
-        terminalId: string;
-        cwd: string;
-        title?: string;
-    };
-} | {
-    type: 'terminal.ERROR';
-    data: {
-        message: string;
-        terminalId?: string;
-    };
-} | {
-    type: 'terminal.TERMINALS_LISTED';
-    data: TerminalInfo[];
-} | {
-    type: 'terminal.TERMINAL_TAB_OPENED';
-    data: TerminalInfo;
-};
 
 type IncomingPullRequestEvents = {
     type: 'pr.GET_BASE_BRANCH';
@@ -1657,6 +1402,11 @@ type OutgoingPullRequestEvents = {
     message: string;
 } | {
     type: 'pr.STATUS_CHANGED';
+    data: {
+        timestamp: Date;
+    };
+} | {
+    type: 'pr.GIT_STATUS_REFRESHED';
     data: {
         timestamp: Date;
     };
@@ -1782,6 +1532,36 @@ type OutgoingPullRequestEvents = {
     };
 };
 
+interface FileChangeInfo {
+    path: string;
+    modifiedAt: Date;
+    changeType: 'add' | 'change' | 'unlink';
+}
+declare class GitWatcherService {
+    private workingDirectory;
+    private gitWatcher?;
+    private workingDirWatcher?;
+    private onGitChangeCallback?;
+    private onFileChangeCallback?;
+    private gitStatusDebounceTimeout?;
+    private fileChangeTimeouts;
+    private isWatching;
+    private openFiles;
+    private gitRepository?;
+    constructor(workingDirectory: string);
+    setGitRepository(repo: GitRepository): void;
+    setChangeCallback(callback: () => void): void;
+    setFileChangeCallback(callback: (change: FileChangeInfo) => void): void;
+    registerOpenFile(filePath: string): void;
+    unregisterOpenFile(filePath: string): void;
+    isFileOpen(filePath: string): boolean;
+    getOpenFiles(): string[];
+    startWatching(): Promise<void>;
+    private handleFileChange;
+    stopWatching(): Promise<void>;
+    isActive(): boolean;
+}
+
 type IncomingCommitEvents = {
     type: 'commit.GET_GIT_STATUS';
 } | {
@@ -1865,7 +1645,6 @@ type IncomingCommitEvents = {
 } | {
     type: 'commit.RESET_TO_COMMIT';
     hash: string;
-    mode: 'soft' | 'mixed' | 'hard';
 };
 type OutgoingCommitEvents = {
     type: 'commit.STATUS_RECEIVED';
@@ -2954,7 +2733,7 @@ interface ThreadEntity extends BaseEntity {
     shortCode?: string;
     status: string;
     tags?: string[];
-    forcedMode?: 'birth';
+    forcedMode?: string;
     pinned?: boolean;
     archived?: boolean;
     chatState?: string;
@@ -2983,7 +2762,7 @@ type ThreadLinkedFields = {
 };
 type ThreadCreateData = Simplify<ThreadEditFields & {
     role?: EARS.RoleKind;
-    forcedMode?: 'birth';
+    forcedMode?: string;
     pinned?: boolean;
 }>;
 type ThreadExtended = Simplify<ThreadEntity & ThreadExtendedData & {
@@ -2992,6 +2771,14 @@ type ThreadExtended = Simplify<ThreadEntity & ThreadExtendedData & {
 type ThreadExtendedData = ThreadLinkedFields & {
     messages?: Partial<MessageEntity>[];
     tags?: string[];
+    topic?: string;
+    instructions?: string;
+    status?: string;
+    pinned?: boolean;
+    archived?: boolean;
+    shortCode?: string;
+    timestamp?: number;
+    lastMessageTimestamp?: number;
 };
 type ThreadConnectedData = {
     threads: ThreadExtended[];
@@ -3012,47 +2799,12 @@ type AgentThreadData = {
     pinned?: boolean;
     chatState?: string;
     context?: ThreadContext;
-    nextCursor?: string | null;
     hasMore?: boolean;
+    nextCursor?: string | null;
 };
 type RecentThreadRefreshData = {
     recentThreads: Partial<ThreadEntity>[];
 };
-interface AgentPhase {
-    id: string;
-    name: string;
-    description: string;
-    color?: string;
-}
-interface AgentMode {
-    id: string;
-    name: string;
-    description: string;
-    phases?: AgentPhase[];
-    hidden?: boolean;
-    disabled?: boolean;
-}
-interface QuickPrompt {
-    id: string;
-    text: string;
-}
-interface CommandItem {
-    name: string;
-    placeholder: string;
-}
-interface AgentSettings {
-    modes: AgentMode[];
-    hotkeys: {
-        textToSpeech?: KeyboardShortcut | null;
-        switchMode?: KeyboardShortcut | null;
-        [key: string]: KeyboardShortcut | null | undefined;
-    };
-    quickPrompts?: QuickPrompt[];
-    quickPromptNumberKeyInserts?: boolean;
-    skipRevertConfirm?: boolean;
-    defaultMode?: string;
-    defaultPhase?: string;
-}
 type AgentConnectedData = {
     currentThread: AgentThreadData | null;
     threads: Partial<ThreadEntity>[];
@@ -3068,13 +2820,16 @@ interface Tab {
     artifacts: ArtifactItem[];
     selectedArtifactId?: string;
     pinned?: boolean;
+    groupId?: string;
 }
-type ArtifactType = 'text' | 'code' | 'review' | 'image' | 'slack' | 'todo' | 'project' | 'json' | 'graph' | 'table' | 'markdown' | 'claude-session' | 'diff' | 'plan' | 'note';
+type ArtifactType = 'text' | 'code' | 'review' | 'image' | 'slack' | 'todo' | 'project' | 'json' | 'graph' | 'table' | 'markdown' | 'claude-session' | 'codex-session' | 'diff' | 'plan' | 'note';
 interface ArtifactItem {
     id: string;
     type: ArtifactType;
     title: string;
     content: any;
+    /** Optional Tailwind color token (e.g. 'blue', 'purple') for the pill background. */
+    color?: string;
     metadata?: {
         createdAt: number;
         updatedAt?: number;
@@ -3211,18 +2966,1108 @@ type OutgoingThreadsEvents = {
     threadId: string;
     error: string;
 } | {
-    type: 'MESSAGES_PAGE_LOADED';
+    type: 'OLDER_MESSAGES_LOADED';
     threadId: string;
     messages: Partial<MessageEntity>[];
-    nextCursor: string | null;
     hasMore: boolean;
+    nextCursor: string | null;
 };
 interface ThreadsContext {
 }
 
-type SystemEvents = {
-    type: 'CLIENT_CONNECTED';
+/** ── Shared aliases ─────────────────────────────────────────────────────── */
+type TimestampMs = number;
+type EntityStatus = 'active' | 'paused' | 'completed' | 'failed';
+type TNodeKind = 'flow' | 'event' | 'step';
+/** ── Core entities ──────────────────────────────────────────────────────── */
+interface TNodeEntity extends BaseEntity {
+    entityType: EARS.Entity.TNode;
+    tNodeType: TNodeKind;
+    label: string;
+    status: EntityStatus;
+    startedAt: TimestampMs;
+    completedAt?: TimestampMs;
+    eventType?: string;
+    triggerType?: 'listener' | 'schedule';
+    cronExpression?: string;
+    stepNodeType?: string;
+    final?: boolean;
+    nodeAttributes?: Record<string, unknown>;
+    resolvedParams?: Record<string, unknown>;
+    blueprint?: {
+        nodeId: EARS.EntityId;
+        flowId: EARS.EntityId;
+    };
+}
+interface TrackEntity extends TNodeEntity {
+    children: TrackEntity[];
+}
+interface EventListenerEntity {
+    id: EARS.EntityId;
+    nodeId: EARS.EntityId;
+    eventType: string;
+    label: string;
+    triggerType: 'listener' | 'schedule';
+    scope?: 'global' | 'local' | 'entry';
+    cronExpression?: string;
+}
+interface FlowTNodeData {
+    flowTNodeId: EARS.EntityId;
+    tNodeTree: TrackEntity[];
+    possibleEvents: EventListenerEntity[];
+    flowHierarchy: Array<{
+        flowTNodeId: EARS.EntityId;
+        label: string;
+    }>;
+}
+interface TNodeUpdate {
+    tNodeId: EARS.EntityId;
+    status: TNodeEntity['status'];
+    eventTNodeId?: EARS.EntityId;
+}
+interface BrainRuntimeError {
+    errorId: string;
+    message: string;
+    stack?: string;
+    source: string;
+    phase: string;
+    flowTNodeId?: EARS.EntityId;
+    eventTNodeId?: EARS.EntityId;
+    tNodeId?: EARS.EntityId;
+    nodeId?: EARS.EntityId;
+    nodeLabel?: string;
+    nodeType?: string;
+    actionId?: EARS.EntityId;
+    actionLabel?: string;
+    eventType?: string;
+    timestamp: TimestampMs;
+}
+
+declare enum BinaryOperator {
+    EQUALS = "equals",
+    NOT_EQUALS = "not_equals",
+    GREATER_THAN = "greater_than",
+    LESS_THAN = "less_than",
+    GREATER_THAN_OR_EQUALS = "greater_than_or_equals",
+    LESS_THAN_OR_EQUALS = "less_than_or_equals",
+    CONTAINS = "contains",
+    STARTS_WITH = "starts_with",
+    ENDS_WITH = "ends_with",
+    MATCHES = "matches",
+    IS_EMPTY = "is_empty",
+    IS_NULL = "is_null"
+}
+
+interface FlowEntity extends BaseEntity {
+    entityType: EARS.Entity.Flow;
+    shortCode: string;
+    label: string;
+    description?: string;
+    flowType: 'workflow' | 'integration';
+    createdAt: number;
+    /** SHA256 hash of the DSL source at last seed. Absent on user-created flows. */
+    sourceHash?: string;
+}
+interface NodeBase extends BaseEntity {
+    entityType: EARS.Entity.Node;
+    /** discriminator */
+    nodeType: NodeKind;
+    label: string;
+    description?: string;
+    color?: string;
+    /** When true, completing this node will trigger parent flow completion */
+    final?: boolean;
+}
+interface QueryNode extends NodeBase {
+    nodeType: 'query';
+    prompt: string;
+    resultKey?: string;
+}
+interface CreateNode extends NodeBase {
+    nodeType: 'create';
+    entityTypeTarget: EARS.Entity;
+    entityId?: string;
+    inferLabel?: boolean;
+}
+interface UpdateNode extends NodeBase {
+    nodeType: 'update';
+    entityId: string;
+    onMissing?: 'fail' | 'ignore' | 'create';
+}
+type Predicate = {
+    key: string;
+    operator: BinaryOperator;
+    value?: any;
+} | ((context: any) => boolean);
+type Condition = {
+    predicate?: Predicate;
+    label?: string;
+    mode?: 'expression' | 'code';
+    code?: string;
 };
+interface SwitchNode extends NodeBase {
+    nodeType: 'switch';
+    conditions: Array<Condition>;
+    elseLabel?: string;
+}
+interface FireNode extends NodeBase {
+    nodeType: 'fire';
+    eventType: string;
+    payload?: unknown;
+    scope?: 'local' | 'global';
+}
+interface ListenerNode extends NodeBase {
+    nodeType: 'listener';
+    scope: 'global' | 'local' | 'entry';
+    eventType: string;
+    /** Stable identity for the compiled/source track that produced this trigger. */
+    trackKey?: string;
+    debounceMs?: number;
+}
+interface TransformNode extends NodeBase {
+    nodeType: 'transform';
+    script: string;
+    outputType?: 'json' | 'text' | 'custom';
+}
+interface FlowNode extends NodeBase {
+    nodeType: 'flow';
+    flowRef: string;
+    propagateCtx?: boolean;
+    fieldMappings?: Array<{
+        target: string;
+        source: string;
+        default?: any;
+    }>;
+}
+interface KeepAliveNode extends NodeBase {
+    nodeType: 'keep_alive';
+}
+interface KillNode extends NodeBase {
+    nodeType: 'kill';
+}
+interface ScheduleNode extends NodeBase {
+    nodeType: 'schedule';
+    cronExpression: string;
+    /** Stable identity for the compiled/source track that produced this trigger. */
+    trackKey?: string;
+}
+interface LLMNode extends NodeBase {
+    nodeType: 'llm';
+    prompt?: string;
+    promptTemplateId?: string;
+    fieldMappings?: Array<{
+        target: string;
+        source: string;
+        default?: any;
+    }>;
+    model?: string;
+    temperature?: number;
+    maxTokens?: number;
+    systemPrompt?: string;
+}
+interface ActionNode extends NodeBase {
+    nodeType: 'action';
+    mode?: 'template' | 'code';
+    actionId?: string;
+    actionFn?: string;
+    params?: Record<string, any>;
+    fieldMappings?: Array<{
+        target: string;
+        source: string;
+        default?: any;
+    }>;
+}
+type NodeEntity = QueryNode | CreateNode | UpdateNode | ActionNode | SwitchNode | FireNode | ListenerNode | TransformNode | FlowNode | KeepAliveNode | KillNode | LLMNode | ScheduleNode;
+/** Literal union of all nodeType strings (keeps Base clean) */
+type NodeKind = NodeEntity['nodeType'];
+type EdgeEntity = {
+    id: EARS.EntityId;
+    kind: EARS.RelKind;
+    source: EARS.EntityId;
+    target: EARS.EntityId;
+    sourceHandle?: string;
+    targetHandle?: string;
+    info?: {
+        [key: string]: any;
+    };
+};
+interface FlowsConnectedData {
+    selectedFlowId: EARS.EntityId;
+    graph: {
+        nodes: NodeEntity[];
+        edges: EdgeEntity[];
+    };
+    flows: Partial<FlowEntity>[];
+    rootFlow?: Partial<FlowEntity>;
+    models: ModelCatalogEntry[];
+    prompts: PromptEntity[];
+    actions: ActionEntity[];
+    settings?: any;
+}
+interface ModelCatalogEntry {
+    id: string;
+    name: string;
+    provider: string;
+    description?: string;
+    contextWindow: number;
+    maxOutput?: number;
+    costPer1kInput?: number;
+    costPer1kOutput?: number;
+    capabilities?: string[];
+}
+
+type BrainInternalEvents = {
+    type: 'TNODE_SPAWNED';
+    tNode: TNodeEntity;
+    parentId?: EARS.EntityId;
+    eventTNodeId?: EARS.EntityId;
+    flowTNodeId: EARS.EntityId;
+} | {
+    type: 'TNODE_UPDATED';
+    data: TNodeUpdate;
+} | {
+    type: 'BRAIN_SETTINGS_UPDATED';
+    settings: any;
+    changes?: any;
+} | {
+    type: 'HANDLE_BRAIN_EVENT';
+    eventType: string;
+    payload?: any;
+    targetFlowId?: string;
+} | {
+    type: 'CHILD_COMPLETED';
+    stepId?: EARS.EntityId;
+    tNodeId?: EARS.EntityId;
+    stepLabel?: string;
+    result?: any;
+    final?: boolean;
+    eventTNodeId?: EARS.EntityId;
+    isFlow?: boolean;
+};
+type OutgoingBrainEvents = {
+    type: 'RECEIVE_PLUGIN_DATA';
+    data: FlowTNodeData;
+} | {
+    type: 'TNODE_OPENED';
+    tNodeId: EARS.EntityId;
+    data: FlowTNodeData;
+} | {
+    type: 'TNODE_SPAWNED';
+    tNode: TNodeEntity;
+    parentId?: EARS.EntityId;
+    eventTNodeId?: EARS.EntityId;
+    flowTNodeId: EARS.EntityId;
+} | {
+    type: 'TNODE_UPDATED';
+    data: TNodeUpdate;
+} | {
+    type: 'EVENT_PULSE';
+    eventType: string;
+} | {
+    type: 'TNODE_DETAILS';
+    tNodeId: EARS.EntityId;
+    details: TNodeEntity | null;
+} | {
+    type: 'BRAIN_RUNTIME_ERROR';
+    error: BrainRuntimeError;
+} | {
+    type: 'INSPECT_TOGGLED';
+    enabled: boolean;
+} | {
+    type: 'BRAIN_KILLED';
+} | {
+    type: 'BRAIN_STARTED';
+} | {
+    type: 'BRAIN_PAUSED';
+} | {
+    type: 'BRAIN_RESUMED';
+};
+interface BrainContext {
+    brainActor?: any;
+    eventQueue: Array<{
+        eventType: string;
+        payload?: any;
+        targetFlowId?: string;
+    }>;
+}
+
+type SecretProvider = 'google' | 'anthropic' | 'openai' | 'groq' | 'mistral' | 'cohere' | 'custom';
+interface SecretData {
+    id: EARS.EntityId;
+    provider: SecretProvider;
+    customName?: string;
+    createdAt: number;
+    updatedAt?: number;
+}
+
+type ExtractEvent<TEvent extends {
+    type: string;
+}, TType extends TEvent['type']> = Extract<TEvent, {
+    type: TType;
+}>;
+/**
+ * Usage:
+ * ```ts
+ * const typeOf = safeEvents<MyUnion>();
+ * const msg = typeOf(['A', 'B'], evt);   // evt is now narrowed
+ * ```
+ */
+declare function safeEvents<TEvent extends {
+    type: string;
+}>(): <TTypes extends TEvent["type"] | readonly TEvent["type"][]>(expected: TTypes, event: TEvent) => ExtractEvent<TEvent, TTypes extends readonly TEvent["type"][] ? TTypes[number] : TTypes>;
+
+/** Add `systemId` literal to every member of an incoming event union. */
+type WithSystemId<Id extends string, E extends {
+    type: string;
+}> = E extends any ? Simplify<E & {
+    systemId: Id;
+}> : never;
+/** Add `pluginId` literal to every member of an outgoing event union. */
+type WithPlugin<Id extends string, E extends {
+    type: string;
+}> = E extends any ? Simplify<E & {
+    pluginId: Id;
+}> : never;
+/** The definition object returned by `defineSystem()`. */
+interface SystemDefinition<Id extends string, TEvents extends {
+    type: string;
+}, TOutgoing extends {
+    type: string;
+}, TContext = {}> {
+    id: Id;
+    types: {
+        context: TContext;
+        events: TEvents | SystemEvents;
+    };
+    typeOf: ReturnType<typeof safeEvents<TEvents | SystemEvents>>;
+    /** Phantom — incoming events with `systemId` attached (wire format). */
+    _incoming: WithSystemId<Id, TEvents>;
+    /** Phantom — outgoing events with `pluginId` attached. */
+    _outgoing: WithPlugin<Id, TOutgoing>;
+}
+
+interface CalendarEventDTO {
+    id: string;
+    title: string;
+    notes: string;
+    startsAt: number;
+    endsAt: number;
+    allDay: boolean;
+    createdAt: number;
+    updatedAt: number;
+}
+interface CalendarConnectedData {
+    events: CalendarEventDTO[];
+}
+
+type OutgoingCalendarEvents = {
+    type: 'CALENDAR_CONNECTED';
+    data: CalendarConnectedData;
+} | {
+    type: 'CALENDAR_EVENT_CREATED';
+    calendarEvent: CalendarEventDTO;
+} | {
+    type: 'CALENDAR_EVENT_UPDATED';
+    calendarEvent: CalendarEventDTO;
+} | {
+    type: 'CALENDAR_EVENT_DELETED';
+    calendarEventId: string;
+};
+
+interface NoteDTO {
+    id: string;
+    title: string;
+    content: string;
+    icon: string | null;
+    noteType: 'document' | 'tasklist' | 'task';
+    completed: boolean;
+    hideCompletedChildren: boolean;
+    parentId: string | null;
+    displayOrder: number;
+    savedDisplayOrder: number | null;
+    childCount: number;
+    createdAt: number;
+    updatedAt: number;
+    lastSeen: number;
+    favorite: boolean;
+    deletedAt?: number;
+}
+type OutgoingNotesSearchEvent = {
+    type: 'NOTES_SEARCH_RESULTS';
+    results: NoteDTO[];
+};
+interface NotesConnectedData {
+    notes: NoteDTO[];
+    settings?: NotesSettings;
+}
+
+type OutgoingNotesEvents = {
+    type: 'NOTES_CONNECTED';
+    data: NotesConnectedData;
+} | {
+    type: 'NOTE_CREATED';
+    note: NoteDTO;
+} | {
+    type: 'NOTE_UPDATED';
+    note: NoteDTO;
+} | {
+    type: 'NOTE_DELETED';
+    noteId: string;
+} | {
+    type: 'NOTE_RESTORED';
+    note: NoteDTO;
+} | {
+    type: 'TRASHED_NOTES';
+    notes: NoteDTO[];
+} | OutgoingNotesSearchEvent | {
+    type: 'NOTES_IMPORTED';
+    count: number;
+    errors?: string[];
+} | {
+    type: 'NOTES_IMPORT_FAILED';
+    errors: string[];
+} | {
+    type: 'NOTES_EXPORTED';
+    filePath: string;
+    itemCount: number;
+} | {
+    type: 'NOTES_EXPORT_FAILED';
+    errors: string[];
+};
+
+type DocumentShortCode = `DOC-${number}`;
+interface FieldContent {
+    type: 'field';
+    fields: Array<{
+        key: string;
+        value: string;
+    }>;
+}
+interface ListContent {
+    type: 'list';
+    items: string[];
+}
+interface MarkdownContent {
+    type: 'markdown';
+    text: string;
+}
+interface TextContent {
+    type: 'text';
+    text: string;
+}
+interface CodeContent {
+    type: 'code';
+    text: string;
+    language: string;
+}
+type ContentSection = FieldContent | ListContent | MarkdownContent | TextContent | CodeContent;
+interface DocumentDTO {
+    id: EARS.EntityId;
+    name: string;
+    content: ContentSection[];
+    shortCode: DocumentShortCode;
+    tags: string[];
+    collectionId?: EARS.EntityId;
+    collectionPath?: string[];
+    displayOrder: number;
+    createdAt: string;
+    updatedAt: string;
+}
+interface CollectionDTO {
+    id: EARS.EntityId;
+    name: string;
+    description?: string;
+    parentId?: EARS.EntityId;
+    path: string[];
+    documentCount: number;
+    childCollections: CollectionDTO[];
+    displayOrder: number;
+    createdAt: string;
+    updatedAt: string;
+    symlinkPath?: string;
+}
+interface FolderItem {
+    type: 'folder';
+    id: EARS.EntityId;
+    name: string;
+    parentId: EARS.EntityId | null;
+    childCount: number;
+    size: string;
+    kind: 'Folder';
+    displayOrder: number;
+    createdAt: string;
+    updatedAt: string;
+    isSymlink?: boolean;
+    symlinkPath?: string;
+    isSymlinked?: boolean;
+    isBroken?: boolean;
+}
+interface DocumentItem {
+    type: 'document';
+    id: EARS.EntityId;
+    name: string;
+    shortCode: DocumentShortCode;
+    parentId: EARS.EntityId | null;
+    content: ContentSection[];
+    tags: string[];
+    size: string;
+    kind: 'Document';
+    displayOrder: number;
+    createdAt: string;
+    updatedAt: string;
+    isSymlinked?: boolean;
+    filePath?: string;
+}
+type LibraryItem = FolderItem | DocumentItem;
+interface FolderContents {
+    items: LibraryItem[];
+    currentPath: string[];
+    currentFolderId: EARS.EntityId | null;
+    breadcrumbs: BreadcrumbItem[];
+    searchIndices?: any[];
+    isBroken?: boolean;
+    lastKnownPath?: string;
+}
+interface BreadcrumbItem {
+    id: EARS.EntityId | null;
+    name: string;
+    path: string[];
+}
+interface LibrarySystemContext {
+    documents: DocumentDTO[];
+    collections: CollectionDTO[];
+    selectedDocumentId?: EARS.EntityId;
+    selectedCollectionId?: EARS.EntityId;
+    currentItems: LibraryItem[];
+    currentFolderId: EARS.EntityId | null;
+    currentPath: string[];
+}
+
+type OutgoingLibraryEvents = {
+    type: 'LIBRARY_CONNECTED';
+    data: {
+        documents: DocumentDTO[];
+        collections: CollectionDTO[];
+        settings: any;
+    };
+} | {
+    type: 'DOCUMENTS_LOADED';
+    data: {
+        documents: DocumentDTO[];
+    };
+} | {
+    type: 'DOCUMENT_CREATED';
+    data: {
+        document: DocumentDTO;
+    };
+} | {
+    type: 'DOCUMENT_UPDATED';
+    data: {
+        document: DocumentDTO;
+    };
+} | {
+    type: 'DOCUMENT_DELETED';
+    data: {
+        documentId: string;
+    };
+} | {
+    type: 'DOCUMENT_LOADED';
+    data: {
+        document: DocumentDTO;
+    };
+} | {
+    type: 'COLLECTIONS_LOADED';
+    data: {
+        collections: CollectionDTO[];
+    };
+} | {
+    type: 'COLLECTION_CREATED';
+    data: {
+        collection: CollectionDTO;
+    };
+} | {
+    type: 'COLLECTION_UPDATED';
+    data: {
+        collection: CollectionDTO;
+    };
+} | {
+    type: 'COLLECTION_DELETED';
+    data: {
+        collectionId: string;
+    };
+} | {
+    type: 'LIBRARY_ERROR';
+    data: {
+        error: string;
+    };
+} | {
+    type: 'SYMLINK_UPDATED';
+    data: {
+        collection: CollectionDTO;
+    };
+} | {
+    type: 'FOLDER_CONTENTS_LOADED';
+    data: FolderContents;
+} | {
+    type: 'NAVIGATION_CHANGED';
+    data: {
+        folderId: string | null;
+        path: string[];
+    };
+} | {
+    type: 'ITEM_RENAMED';
+    data: {
+        item: LibraryItem;
+    };
+} | {
+    type: 'ITEMS_DELETED';
+    data: {
+        ids: string[];
+    };
+} | {
+    type: 'ITEMS_MOVED';
+    data: {
+        ids: string[];
+        targetFolderId: string | null;
+    };
+} | {
+    type: 'LIBRARY_IMPORTED';
+    count: number;
+    errors?: string[];
+} | {
+    type: 'LIBRARY_IMPORT_FAILED';
+    errors: string[];
+} | {
+    type: 'LIBRARY_EXPORTED';
+    filePath: string;
+    itemCount: number;
+} | {
+    type: 'LIBRARY_EXPORT_FAILED';
+    errors: string[];
+};
+
+type OutgoingActionEvents = {
+    type: 'ACTIONS_LISTED';
+    data: ActionsStartupData;
+} | {
+    type: 'ACTION_SELECTED';
+    actionId: EARS.EntityId;
+    data: ActionEntity;
+} | {
+    type: 'ACTION_CREATED';
+    action: ActionEntity;
+    actionId: EARS.EntityId;
+} | {
+    type: 'ACTION_UPDATED';
+    action: ActionEntity;
+    actionId: EARS.EntityId;
+} | {
+    type: 'ACTION_DELETED';
+    actionId: EARS.EntityId;
+} | {
+    type: 'ACTIONS_PAGE_LOADED';
+    data: {
+        actions: ActionEntity[];
+        page: number;
+        totalPages: number;
+    };
+} | {
+    type: 'ACTIONS_ALL_LOADED';
+    data: {
+        actions: ActionEntity[];
+    };
+} | {
+    type: 'ACTIONS_IMPORTED';
+    count: number;
+    errors?: string[];
+} | {
+    type: 'ACTIONS_IMPORT_FAILED';
+    errors: string[];
+} | {
+    type: 'ACTIONS_EXPORTED';
+    filePath: string;
+    actionCount: number;
+} | {
+    type: 'ACTIONS_EXPORT_FAILED';
+    errors: string[];
+};
+
+type OutgoingPromptEvents = {
+    type: 'PROMPTS_CONNECTED';
+    data: PromptsConnectedData;
+} | {
+    type: 'PROMPT_SELECTED';
+    promptId: EARS.EntityId;
+    data: PromptEntity;
+} | {
+    type: 'PROMPT_CREATED';
+    prompt: PromptEntity;
+    promptId: EARS.EntityId;
+} | {
+    type: 'PROMPT_UPDATED';
+    prompt: PromptEntity;
+    promptId: EARS.EntityId;
+} | {
+    type: 'PROMPT_DELETED';
+    promptId: EARS.EntityId;
+} | {
+    type: 'PROMPTS_PAGE_LOADED';
+    data: {
+        prompts: PromptEntity[];
+        page: number;
+        totalPages: number;
+    };
+} | {
+    type: 'PROMPTS_ALL_LOADED';
+    data: {
+        prompts: PromptEntity[];
+    };
+} | {
+    type: 'PROMPTS_IMPORTED';
+    count: number;
+    errors?: string[];
+} | {
+    type: 'PROMPTS_IMPORT_FAILED';
+    errors: string[];
+} | {
+    type: 'PROMPTS_EXPORTED';
+    filePath: string;
+    promptCount: number;
+} | {
+    type: 'PROMPTS_EXPORT_FAILED';
+    errors: string[];
+};
+
+declare const LogLevel: z.ZodEnum<["debug", "info", "warn", "error"]>;
+type LogLevel = z.infer<typeof LogLevel>;
+declare const LogEntry: z.ZodObject<{
+    id: z.ZodString;
+    timestamp: z.ZodNumber;
+    level: z.ZodEnum<["debug", "info", "warn", "error"]>;
+    message: z.ZodString;
+    source: z.ZodOptional<z.ZodString>;
+    meta: z.ZodOptional<z.ZodRecord<z.ZodString, z.ZodAny>>;
+    stack: z.ZodOptional<z.ZodString>;
+}, "strip", z.ZodTypeAny, {
+    id: string;
+    message: string;
+    timestamp: number;
+    level: "debug" | "info" | "warn" | "error";
+    meta?: Record<string, any> | undefined;
+    source?: string | undefined;
+    stack?: string | undefined;
+}, {
+    id: string;
+    message: string;
+    timestamp: number;
+    level: "debug" | "info" | "warn" | "error";
+    meta?: Record<string, any> | undefined;
+    source?: string | undefined;
+    stack?: string | undefined;
+}>;
+type LogEntry = z.infer<typeof LogEntry>;
+
+type OutgoingLogsEvents = {
+    type: 'LOGS_CONNECTED';
+    logs: LogEntry[];
+    settings?: LogsSettings;
+} | {
+    type: 'LOGS_UPDATE';
+    logs: LogEntry[];
+} | {
+    type: 'LOG_ADDED';
+    log: LogEntry;
+} | {
+    type: 'LOGS_CLEARED';
+} | {
+    type: 'LOGS_SETTINGS_UPDATED';
+    settings: LogsSettings;
+};
+interface LogsContext {
+    logs: LogEntry[];
+}
+
+interface DatabaseSchemaInfo {
+    entities: Array<{
+        type: EARS.Entity;
+    }>;
+    attributes: Array<{
+        kind: string;
+    }>;
+    relations: Array<{
+        kind: EARS.RelKind;
+    }>;
+}
+interface DatabaseStartupData {
+    schema: DatabaseSchemaInfo;
+}
+
+type OutgoingDatabaseEvents = {
+    type: 'DATABASE_REFRESH';
+    data: DatabaseStartupData;
+} | {
+    type: 'QUERY_RESULT';
+    result: any;
+    executionTime: number;
+} | {
+    type: 'QUERY_ERROR';
+    error: string;
+} | {
+    type: 'TRANSACTION_RESULT';
+    result: any;
+    executionTime: number;
+} | {
+    type: 'TRANSACTION_ERROR';
+    error: string;
+} | {
+    type: 'AI_QUERY_LOADING';
+} | {
+    type: 'AI_QUERY_GENERATED';
+    query: string;
+} | {
+    type: 'TRACE_FLOWS_RESULT';
+    flows: TNodeEntity[];
+} | {
+    type: 'FLOW_EVENTS_RESULT';
+    flowId: string;
+    events: TNodeEntity[];
+    hasMore: boolean;
+} | {
+    type: 'NODE_DETAILS_RESULT';
+    nodeId: string;
+    details: TNodeEntity | null;
+} | {
+    type: 'EXPORT_DATABASE_SUCCESS';
+    path: string;
+} | {
+    type: 'EXPORT_DATABASE_ERROR';
+    error: string;
+} | {
+    type: 'IMPORT_DATABASE_SUCCESS';
+    message?: string;
+} | {
+    type: 'IMPORT_DATABASE_ERROR';
+    error: string;
+} | {
+    type: 'BACKUP_INFO_RESULT';
+    info: {
+        timestamp: number;
+        databases: string[];
+        size: number;
+        hasMedia?: boolean;
+    } | null;
+} | {
+    type: 'RESET_DATABASE_SUCCESS';
+    message: string;
+} | {
+    type: 'RESET_DATABASE_ERROR';
+    error: string;
+};
+
+type OutgoingFlowsEvents = {
+    type: 'FLOWS_CONNECTED';
+    data: FlowsConnectedData;
+} | {
+    type: 'FLOW_SELECTED';
+    flowId: EARS.EntityId;
+    data: {
+        nodes: any[];
+        edges: any[];
+    };
+} | {
+    type: 'FLOW_CREATED';
+    flow: FlowEntity;
+    flowId: EARS.EntityId;
+    data: {
+        nodes: any[];
+        edges: any[];
+    };
+} | {
+    type: 'FLOW_DELETED';
+    flowId: EARS.EntityId;
+} | {
+    type: 'NODE_CREATED';
+    tempId: string;
+    nodeId: EARS.EntityId;
+    node: any;
+} | {
+    type: 'NODE_UPDATED';
+    nodeId: EARS.EntityId;
+    node: any;
+} | {
+    type: 'NODE_DELETED';
+    nodeId: string;
+} | {
+    type: 'EDGE_CREATED';
+    sourceId: EARS.EntityId;
+    targetId: EARS.EntityId;
+    relId: EARS.EntityId;
+    sourceHandle?: string;
+    targetHandle?: string;
+} | {
+    type: 'EDGE_CREATE_FAILED';
+    sourceId: string;
+    targetId: string;
+    error: string;
+} | {
+    type: 'EDGE_DELETED';
+    edgeId: string;
+} | {
+    type: 'EDGE_UPDATED';
+    oldEdgeId: EARS.EntityId;
+    newEdgeId: EARS.EntityId;
+    newSource: EARS.EntityId;
+    newTarget: EARS.EntityId;
+} | {
+    type: 'ACTION_CREATED';
+    action: ActionEntity;
+    actionId: EARS.EntityId;
+} | {
+    type: 'ACTION_UPDATED';
+    action: ActionEntity;
+    actionId: EARS.EntityId;
+} | {
+    type: 'ACTION_DELETED';
+    actionId: EARS.EntityId;
+} | {
+    type: 'DSL_IMPORTED';
+    flowIds: EARS.EntityId[];
+    errors?: string[];
+} | {
+    type: 'DSL_IMPORT_FAILED';
+    errors: string[];
+} | {
+    type: 'DSL_EXPORTED';
+    filePath: string;
+    flowCount: number;
+} | {
+    type: 'DSL_EXPORT_FAILED';
+    errors: string[];
+};
+
+type SecretsOutputEvents = {
+    type: 'SECRETS.EVENT.LOADED';
+    data: SecretData[];
+} | {
+    type: 'SECRETS.EVENT.CREATED';
+    id: EARS.EntityId;
+    provider: SecretProvider;
+    customName?: string;
+} | {
+    type: 'SECRETS.EVENT.UPDATED';
+    id: EARS.EntityId;
+} | {
+    type: 'SECRETS.EVENT.DELETED';
+    id: EARS.EntityId;
+} | {
+    type: 'SECRETS.EVENT.VALUE';
+    id: EARS.EntityId;
+    value: string;
+} | {
+    type: 'SECRETS.EVENT.ERROR';
+    message: string;
+};
+
+/**
+ * Database Seed — loads compiled default-setup artifacts into LMDB
+ *
+ * Skips seeding if the compiled data hash is unchanged since last seed,
+ * unless `force` is passed. The CLI script always forces.
+ */
+interface SeedCounts {
+    created: number;
+    updated: number;
+    skipped: number;
+}
+interface SeedResult {
+    actions: SeedCounts;
+    prompts: SeedCounts;
+    flows: SeedCounts;
+    library: SeedCounts;
+    notes: SeedCounts;
+    settings: SeedCounts;
+}
+
+/**
+ * Setup Pack Preview — reads compiled artifacts from a directory and
+ * reports the top-level items available for selective import.
+ */
+type SetupPackType = 'actions' | 'prompts' | 'flows' | 'library' | 'notes' | 'settings';
+type SetupPackItemKind = 'collection' | 'document' | 'tasklist' | 'task';
+interface SetupPackPreviewItem {
+    key: string;
+    description?: string;
+    kind?: SetupPackItemKind;
+    childCount?: number;
+}
+interface SetupPackPreview {
+    directory: string;
+    actions: SetupPackPreviewItem[];
+    prompts: SetupPackPreviewItem[];
+    flows: SetupPackPreviewItem[];
+    library: SetupPackPreviewItem[];
+    notes: SetupPackPreviewItem[];
+    settings: SetupPackPreviewItem[];
+    missing: SetupPackType[];
+}
+
+type OutgoingSettingsEvents = {
+    type: 'SETTINGS_LOADED';
+    data: SettingsData;
+    faqs: FAQItem[];
+} | {
+    type: 'SETTINGS_UPDATED';
+    data: SettingsData;
+} | {
+    type: 'SETTINGS_RESET';
+    data: SettingsData;
+} | {
+    type: 'APPLICATION_HOTKEYS';
+    hotkeys: SettingsData['general']['application']['hotkeys'];
+} | {
+    type: 'CLI_TEST_RESULT';
+    provider: string;
+    success: boolean;
+    error?: string;
+    resolvedPath?: string;
+} | {
+    type: 'SETUP_PACK_IMPORTED';
+    result: SeedResult;
+} | {
+    type: 'SETUP_PACK_IMPORT_FAILED';
+    error: string;
+} | {
+    type: 'SETUP_PACK_PREVIEW';
+    preview: SetupPackPreview;
+} | {
+    type: 'SETUP_PACK_PREVIEW_FAILED';
+    error: string;
+} | {
+    type: 'APP_RESET_COMPLETE';
+} | {
+    type: 'APP_RESET_FAILED';
+    error: string;
+} | SecretsOutputEvents;
+
+type SystemErrorSeverity = 'error' | 'fatal';
+type SystemErrorEvent = {
+    type: 'SYSTEM_ERROR';
+    pluginId: 'application';
+    errorId: string;
+    message: string;
+    title?: string;
+    source?: string;
+    operation?: string;
+    entityId?: string;
+    severity: SystemErrorSeverity;
+    stack?: string;
+    timestamp: number;
+};
+type ApplicationOutgoingEvents = {
+    type: 'CLIENT_CONNECTED';
+    hasOnboarded: boolean;
+    pluginId: 'application';
+} | SystemErrorEvent;
 
 declare const allDefs: readonly [SystemDefinition<"settings", ({
     type: "GET_SETTINGS";
@@ -3267,6 +4112,9 @@ declare const allDefs: readonly [SystemDefinition<"settings", ({
     };
     mode?: "keep-existing" | "replace-on-collision" | "wipe-and-replace";
     restartBrain?: boolean;
+} | {
+    type: "REPLACE_SETTINGS";
+    data: SettingsData;
 } | {
     type: "RESET_APP";
 }) | SecretsOutputEvents, OutgoingSettingsEvents, {}>, SystemDefinition<"brain", ({
@@ -3782,226 +4630,40 @@ declare const allDefs: readonly [SystemDefinition<"settings", ({
     type: "EXPORT_NOTES";
     directory: string;
     format: "markdown" | "json";
-}, OutgoingNotesEvents, {}>, SystemDefinition<"hermes", {
-    type: "HERMES_INSTALL";
+}, OutgoingNotesEvents, {}>, SystemDefinition<"browser", ({
+    type: "SYNC_TABS";
+    tabs: SavedTab[];
 } | {
-    type: "HERMES_START_BRIDGE";
-} | {
-    type: "HERMES_STOP_BRIDGE";
-} | {
-    type: "HERMES_CHECK_CONNECTION";
-} | {
-    type: "HERMES_GET_SKILLS";
-} | {
-    type: "HERMES_SAVE_SKILL";
-    name: string;
-    category?: string;
-    content: string;
-} | {
-    type: "HERMES_DELETE_SKILL";
-    path: string;
-} | {
-    type: "HERMES_GET_PERSONA";
-} | {
-    type: "HERMES_UPDATE_PERSONA";
-    content: string;
-} | {
-    type: "HERMES_GET_MEMORY";
-} | {
-    type: "HERMES_WRITE_MEMORY";
-    filename: string;
-    content: string;
-} | {
-    type: "HERMES_GET_TOOLS";
-} | {
-    type: "HERMES_GET_MODELS";
-} | {
-    type: "HERMES_GET_WORKSPACES";
-} | {
-    type: "HERMES_UPDATE_CONFIG";
-    provider?: string;
-    apiKey?: string;
-    model?: string;
+    type: "SYNC_BOOKMARKS";
+    bookmarks: SavedBookmark[];
+}) | {
+    type: "CLIENT_CONNECTED";
 }, {
-    type: "HERMES_CONNECTED";
-    data: HermesConnectedData;
+    type: "BROWSER_CONNECTED";
+    savedTabs: SavedTab[];
+    savedBookmarks: SavedBookmark[];
+}, BrowserContext>, SystemDefinition<"calendar", {
+    type: "CREATE_CALENDAR_EVENT";
+    title: string;
+    startsAt: number;
+    endsAt: number;
+    allDay?: boolean;
+    notes?: string;
 } | {
-    type: "HERMES_INSTALL_STATUS";
-    installStatus: string;
-    version: string | null;
-    source?: string;
-    error?: string;
+    type: "UPDATE_CALENDAR_EVENT";
+    id: string;
+    title?: string;
+    startsAt?: number;
+    endsAt?: number;
+    allDay?: boolean;
+    notes?: string;
 } | {
-    type: "HERMES_BRIDGE_STATUS";
-    bridge: BridgeInfo;
-} | {
-    type: "HERMES_SKILLS_DATA";
-    skills: HermesSkill[];
-} | {
-    type: "HERMES_SKILL_SAVED";
-    saved: boolean;
-    path: string;
-} | {
-    type: "HERMES_SKILL_DELETED";
-    deleted: boolean;
-} | {
-    type: "HERMES_PERSONA_DATA";
-    content: string;
-    path: string;
-} | {
-    type: "HERMES_PERSONA_UPDATED";
-    written: boolean;
-} | {
-    type: "HERMES_MEMORY_DATA";
-    files: Record<string, string>;
-} | {
-    type: "HERMES_MEMORY_WRITTEN";
-    written: boolean;
-    filename: string;
-} | {
-    type: "HERMES_TOOLS_DATA";
-    tools: Array<{
-        name: string;
-        enabled: boolean;
-        description: string;
-    }>;
-    enabledToolsets: string[];
-} | {
-    type: "HERMES_MODELS_DATA";
-    models: Array<{
-        name: string;
-        provider: string;
-        model: string;
-    }>;
-} | {
-    type: "HERMES_WORKSPACES_DATA";
-    workspaces: string[];
-} | {
-    type: "HERMES_ERROR";
-    message: string;
-    method: string;
-}, {}>];
+    type: "DELETE_CALENDAR_EVENT";
+    id: string;
+}, OutgoingCalendarEvents, {}>];
 type AllDefs = (typeof allDefs)[number];
 type IncomingSystemEvents = AllDefs['_incoming'];
-type OutgoingSystemEvents = AllDefs['_outgoing'];
-
-type ExtractEvent<TEvent extends {
-    type: string;
-}, TType extends TEvent['type']> = Extract<TEvent, {
-    type: TType;
-}>;
-/**
- * Usage:
- * ```ts
- * const typeOf = safeEvents<MyUnion>();
- * const msg = typeOf(['A', 'B'], evt);   // evt is now narrowed
- * ```
- */
-declare function safeEvents<TEvent extends {
-    type: string;
-}>(): <TTypes extends TEvent["type"] | readonly TEvent["type"][]>(expected: TTypes, event: TEvent) => ExtractEvent<TEvent, TTypes extends readonly TEvent["type"][] ? TTypes[number] : TTypes>;
-
-/** Add `systemId` literal to every member of an incoming event union. */
-type WithSystemId<Id extends string, E extends {
-    type: string;
-}> = E extends any ? Simplify<E & {
-    systemId: Id;
-}> : never;
-/** Add `pluginId` literal to every member of an outgoing event union. */
-type WithPlugin<Id extends string, E extends {
-    type: string;
-}> = E extends any ? Simplify<E & {
-    pluginId: Id;
-}> : never;
-/** The definition object returned by `defineSystem()`. */
-interface SystemDefinition<Id extends string, TEvents extends {
-    type: string;
-}, TOutgoing extends {
-    type: string;
-}, TContext = {}> {
-    id: Id;
-    types: {
-        context: TContext;
-        events: TEvents | SystemEvents;
-    };
-    typeOf: ReturnType<typeof safeEvents<TEvents | SystemEvents>>;
-    /** Phantom — incoming events with `systemId` attached (wire format). */
-    _incoming: WithSystemId<Id, TEvents>;
-    /** Phantom — outgoing events with `pluginId` attached. */
-    _outgoing: WithPlugin<Id, TOutgoing>;
-}
-
-type BrainInternalEvents = {
-    type: 'TNODE_SPAWNED';
-    tNode: TNodeEntity;
-    parentId?: EARS.EntityId;
-    eventTNodeId?: EARS.EntityId;
-    flowTNodeId: EARS.EntityId;
-} | {
-    type: 'TNODE_UPDATED';
-    data: TNodeUpdate;
-} | {
-    type: 'BRAIN_SETTINGS_UPDATED';
-    settings: any;
-    changes?: any;
-} | {
-    type: 'HANDLE_BRAIN_EVENT';
-    eventType: string;
-    payload?: any;
-    targetFlowId?: string;
-} | {
-    type: 'CHILD_COMPLETED';
-    stepId?: EARS.EntityId;
-    tNodeId?: EARS.EntityId;
-    stepLabel?: string;
-    result?: any;
-    final?: boolean;
-    eventTNodeId?: EARS.EntityId;
-    isFlow?: boolean;
-};
-type OutgoingBrainEvents = {
-    type: 'RECEIVE_PLUGIN_DATA';
-    data: FlowTNodeData;
-} | {
-    type: 'TNODE_OPENED';
-    tNodeId: EARS.EntityId;
-    data: FlowTNodeData;
-} | {
-    type: 'TNODE_SPAWNED';
-    tNode: TNodeEntity;
-    parentId?: EARS.EntityId;
-    eventTNodeId?: EARS.EntityId;
-    flowTNodeId: EARS.EntityId;
-} | {
-    type: 'TNODE_UPDATED';
-    data: TNodeUpdate;
-} | {
-    type: 'EVENT_PULSE';
-    eventType: string;
-} | {
-    type: 'TNODE_DETAILS';
-    tNodeId: EARS.EntityId;
-    details: TNodeEntity | null;
-} | {
-    type: 'INSPECT_TOGGLED';
-    enabled: boolean;
-} | {
-    type: 'BRAIN_KILLED';
-} | {
-    type: 'BRAIN_STARTED';
-} | {
-    type: 'BRAIN_PAUSED';
-} | {
-    type: 'BRAIN_RESUMED';
-};
-interface BrainContext {
-    brainActor?: any;
-    eventQueue: Array<{
-        eventType: string;
-        payload?: any;
-        targetFlowId?: string;
-    }>;
-}
+type OutgoingSystemEvents = AllDefs['_outgoing'] | ApplicationOutgoingEvents;
 
 interface SafeLinkOptions {
     /** Additional info to store with the relation */
@@ -4047,134 +4709,8 @@ declare function tx(typeOrId: EARS.Entity | EARS.EntityId, useProvidedId?: boole
         roles?: string | string[];
     }) => /*elided*/ any;
     readonly destroy: (skipPersistence?: boolean) => never;
-    readonly id: () => `Agent-${string}` | `Brain-${string}` | `Message-${string}` | `Thread-${string}` | `Relation-${string}` | `Artifact-${string}` | `Flow-${string}` | `Node-${string}` | `TNode-${string}` | `Prompt-${string}` | `Action-${string}` | `Document-${string}` | `Collection-${string}` | `SearchIndex-${string}` | `IndexedDoc-${string}` | `Terminal-${string}` | `Directory-${string}` | `Settings-${string}` | `FAQ-${string}` | `Secret-${string}` | `Note-${string}`;
+    readonly id: () => `Agent-${string}` | `Brain-${string}` | `Message-${string}` | `Thread-${string}` | `Relation-${string}` | `Artifact-${string}` | `Flow-${string}` | `Node-${string}` | `TNode-${string}` | `Prompt-${string}` | `Action-${string}` | `Document-${string}` | `Collection-${string}` | `SearchIndex-${string}` | `IndexedDoc-${string}` | `Terminal-${string}` | `Directory-${string}` | `Settings-${string}` | `FAQ-${string}` | `Secret-${string}` | `Note-${string}` | `BrowserTab-${string}` | `BrowserBookmark-${string}` | `CalendarEvent-${string}`;
 };
-
-type SETTINGS_SCOPE = 'general' | 'plugin' | 'internal';
-interface SettingsData {
-    general: GeneralSettings;
-    plugins: PluginSettings;
-    internal: InternalSettings;
-    assistant: AssistantSettings;
-}
-interface GeneralSettings {
-    personal: PersonalInfo;
-    secrets: Secrets;
-    application: AppSettings;
-    projects: Project[];
-}
-interface Address {
-    street: string;
-    street2?: string;
-    city: string;
-    state: string;
-    postalCode: string;
-    country: string;
-}
-interface PersonalInfo {
-    name?: string;
-    phoneNumber?: string;
-    address?: string | Address;
-}
-interface Secrets {
-    google?: string | null;
-    anthropic?: string | null;
-    openai?: string | null;
-    groq?: string | null;
-    mistral?: string | null;
-    cohere?: string | null;
-    custom?: Record<string, string>;
-    required: string[];
-    cliPaths?: Record<string, string>;
-}
-interface KeyboardShortcut {
-    key: string;
-    modifiers: string[];
-    global?: boolean;
-}
-interface CustomHotkey extends KeyboardShortcut {
-    id: string;
-    eventName: string;
-}
-interface ApplicationHotkeys {
-    switchPluginUp?: KeyboardShortcut;
-    switchPluginDown?: KeyboardShortcut;
-    toggleInspectionPanel?: KeyboardShortcut;
-    custom?: CustomHotkey[];
-}
-interface AppSettings {
-    hotkeys: ApplicationHotkeys;
-}
-interface Project {
-    name: string;
-    directories: string[];
-    color: string;
-}
-interface PluginVisibilitySettings {
-    [pluginId: string]: boolean;
-}
-interface Category {
-    name: string;
-    color: string;
-}
-interface ThreadStatusOption {
-    label: string;
-    color: string;
-}
-interface ThreadTagOption {
-    name: string;
-    color?: string;
-}
-interface ChatStateConfig {
-    id: string;
-    label: string;
-    color: string;
-    busy: boolean;
-}
-interface ThreadsSettings {
-    statuses: ThreadStatusOption[];
-    tags: ThreadTagOption[];
-    chatStates: ChatStateConfig[];
-    showOnlyRootThreads: boolean;
-    clickToChat: boolean;
-    recentThreadsLimit: number;
-    recentThreadsSortOrder: 'created' | 'visited' | 'message';
-    recordingLimitMinutes: number;
-    skipArchiveConfirm?: boolean;
-    chat?: AgentSettings;
-}
-interface NotesSettings {
-    tasklistPanelPosition: 'left' | 'right';
-}
-interface LogsSettings {
-    maxLogs: number;
-    excludedSources: string[];
-    showAppEvents?: boolean;
-}
-interface PluginSettings {
-    _meta?: {
-        visibility?: PluginVisibilitySettings;
-        lastActivePlugin?: string;
-    };
-    [pluginId: string]: any;
-}
-interface InternalSettings {
-    hasOnboarded: boolean;
-    lastInteractionTimestamp: number | null;
-    version: string;
-    seedHash: string | null;
-}
-interface AssistantSettings {
-    name: string;
-    birthdate: string | null;
-}
-interface FAQItem {
-    id: string;
-    question: string;
-    answer: string;
-    category?: string;
-    order?: number;
-}
 
 interface FileInfo {
     name: string;
@@ -4194,6 +4730,7 @@ interface FileContent {
     encoding: string;
     size?: number;
     isBinary?: boolean;
+    isVideo?: boolean;
 }
 interface CodeSystemError {
     code: 'NOT_FOUND' | 'PERMISSION_DENIED' | 'INVALID_PATH' | 'IO_ERROR' | 'FILE_TOO_LARGE' | 'SEARCH_ERROR';
@@ -4303,6 +4840,13 @@ interface GhReviewThread {
     isOutdated: boolean;
     path: string;
     line: number | null;
+    startLine?: number | null;
+    originalLine?: number | null;
+    originalStartLine?: number | null;
+    diffSide?: 'LEFT' | 'RIGHT' | null;
+    startDiffSide?: 'LEFT' | 'RIGHT' | null;
+    subjectType?: 'LINE' | 'FILE' | null;
+    diffHunk?: string | null;
     comments: GhReviewComment[];
 }
 interface GhReviewComment {
@@ -4314,6 +4858,12 @@ interface GhReviewComment {
     };
     createdAt: string;
     viewerDidAuthor: boolean;
+    path?: string | null;
+    line?: number | null;
+    startLine?: number | null;
+    originalLine?: number | null;
+    originalStartLine?: number | null;
+    diffHunk?: string | null;
 }
 interface TerminalInfo {
     id: EARS.EntityId;
@@ -4350,7 +4900,7 @@ interface CodeSettings {
     };
     restoreTerminals?: boolean;
     defaultBaseDirectory?: string | null;
-    lastDirectoryOpened?: string | null;
+    baseDirectory?: string | null;
     enableShellIntegration?: boolean;
     confirmTerminalClose?: boolean;
     closeTerminalOnTabClose?: boolean;
@@ -4514,6 +5064,26 @@ interface AuthStatus {
     [key: string]: unknown;
 }
 
+/**
+ * Low-level one-shot process primitive for the Codex CLI.
+ *
+ * Mirrors `claude-code/runner.ts:execOnce` but resolves the `codex` binary
+ * and uses Codex-appropriate env scrubbing.
+ */
+interface CodexExecOptions {
+    cwd?: string;
+    env?: NodeJS.ProcessEnv;
+    input?: string;
+    timeoutMs?: number;
+    signal?: AbortSignal;
+    cliPath?: string;
+}
+interface CodexExecResult {
+    stdout: string;
+    stderr: string;
+    exitCode: number;
+}
+
 interface CliServiceType {
     git: {
         commit(message: string): Promise<void>;
@@ -4614,6 +5184,20 @@ interface CliServiceType {
         renameSession(id: string, title: string, opts?: {
             cwd?: string;
         }): Promise<void>;
+        /** Check whether a session JSONL file exists under the given (or default) project directory. */
+        sessionExists(id: string, opts?: {
+            cwd?: string;
+        }): Promise<boolean>;
+    };
+    /** Codex CLI wrapper for one-shot tasks. */
+    codex: {
+        /**
+         * Low-level one-shot CLI invocation via `codex exec`.
+         * `cwd` defaults to the configured project directory.
+         */
+        exec(args: readonly string[], opts?: Omit<CodexExecOptions, 'cwd'> & {
+            cwd?: string;
+        }): Promise<CodexExecResult>;
     };
 }
 
@@ -4689,47 +5273,6 @@ declare class SettingsService {
     getSettingValue(type: SETTINGS_SCOPE, label: string, path: string[]): any;
 }
 
-interface TerminalEntity {
-    id: EARS.EntityId;
-    entityType: EARS.Entity.Terminal;
-    title: string;
-    customTitle?: string;
-    pid: number;
-    shell: string;
-    cwd: string;
-    active: boolean;
-    cols: number;
-    rows: number;
-    createdAt: number;
-    updatedAt: number;
-    closedAt?: number;
-}
-interface StartupData {
-    terminals: TerminalInfo[];
-}
-
-/**
- * Flow DSL Compiler
- *
- * Transforms track-based DSL format into EARS database format.
- * Each track creates a listener node + sequential step nodes.
- */
-
-type Relation = {
-    source: string;
-    kind: EARS.RelKind;
-    target: string;
-    info?: object;
-};
-interface CompiledRows {
-    entity: object[];
-    relation: Relation[];
-    role: Array<{
-        entityId: string;
-        role: string;
-    }>;
-}
-
 declare class LibraryService {
     get(id: EARS.EntityId): Promise<DocumentDTO | undefined>;
     getByCode(shortCode: string): Promise<DocumentDTO | undefined>;
@@ -4759,15 +5302,15 @@ declare class LibraryService {
 }
 
 declare class ActionService {
-    getById(id: EARS.EntityId): ActionEntity | undefined;
-    getByLabel(label: string): ActionEntity | undefined;
-    getByCategory(category: string): ActionEntity[];
+    getById(id: EARS.EntityId): any;
+    getByLabel(label: string): any;
+    getByCategory(category: string): any;
     executeAction(actionFn: string, params?: Record<string, any>): Promise<any>;
     getAndExecute(label: string, params?: Record<string, any>): Promise<any | undefined>;
 }
 
 declare class PromptService {
-    getByLabel(label: string): PromptEntity | undefined;
+    getByLabel(label: string): any;
     /**
      * Execute a template with prompt context for accessing other prompts
      * @param templateFn - The template function body
@@ -4782,7 +5325,17 @@ declare class PromptService {
     usePrompt(label: string, templateParams: Record<string, any>): string | undefined;
 }
 
+/**
+ * Unified auth credential resolution for LLM providers.
+ *
+ * Supports two auth modes:
+ * 1. ChatGPT OAuth — access token + ChatGPT-Account-ID header (Pro subscribers)
+ * 2. API key — traditional API key auth
+ *
+ * Priority: ChatGPT OAuth tokens > explicit API key > settings/secrets > env vars.
+ */
 type ProviderName = 'anthropic' | 'google' | 'openai' | 'groq' | 'mistral' | 'cohere';
+
 type Provider = ProviderName | 'openai.responses' | string;
 type ModelConfig = {
     provider: Provider;
@@ -4958,16 +5511,16 @@ declare const qx: (seed?: EARS.EntityId | EARS.Entity | readonly EARS.Entity[] |
     readonly reverse: () => /*elided*/ any;
     readonly limit: (n: number) => /*elided*/ any;
     readonly page: (size: number, cursor?: string | null) => {
-        readonly items: (`Agent-${string}` | `Brain-${string}` | `Message-${string}` | `Thread-${string}` | `Relation-${string}` | `Artifact-${string}` | `Flow-${string}` | `Node-${string}` | `TNode-${string}` | `Prompt-${string}` | `Action-${string}` | `Document-${string}` | `Collection-${string}` | `SearchIndex-${string}` | `IndexedDoc-${string}` | `Terminal-${string}` | `Directory-${string}` | `Settings-${string}` | `FAQ-${string}` | `Secret-${string}` | `Note-${string}`)[];
+        readonly items: (`Agent-${string}` | `Brain-${string}` | `Message-${string}` | `Thread-${string}` | `Relation-${string}` | `Artifact-${string}` | `Flow-${string}` | `Node-${string}` | `TNode-${string}` | `Prompt-${string}` | `Action-${string}` | `Document-${string}` | `Collection-${string}` | `SearchIndex-${string}` | `IndexedDoc-${string}` | `Terminal-${string}` | `Directory-${string}` | `Settings-${string}` | `FAQ-${string}` | `Secret-${string}` | `Note-${string}` | `BrowserTab-${string}` | `BrowserBookmark-${string}` | `CalendarEvent-${string}`)[];
         readonly nextCursor: string | null;
     };
     readonly distinct: (field?: string) => /*elided*/ any;
     readonly groupBy: (field: string) => Map<unknown, /*elided*/ any>;
-    readonly ids: () => (`Agent-${string}` | `Brain-${string}` | `Message-${string}` | `Thread-${string}` | `Relation-${string}` | `Artifact-${string}` | `Flow-${string}` | `Node-${string}` | `TNode-${string}` | `Prompt-${string}` | `Action-${string}` | `Document-${string}` | `Collection-${string}` | `SearchIndex-${string}` | `IndexedDoc-${string}` | `Terminal-${string}` | `Directory-${string}` | `Settings-${string}` | `FAQ-${string}` | `Secret-${string}` | `Note-${string}`)[];
-    readonly id: () => `Agent-${string}` | `Brain-${string}` | `Message-${string}` | `Thread-${string}` | `Relation-${string}` | `Artifact-${string}` | `Flow-${string}` | `Node-${string}` | `TNode-${string}` | `Prompt-${string}` | `Action-${string}` | `Document-${string}` | `Collection-${string}` | `SearchIndex-${string}` | `IndexedDoc-${string}` | `Terminal-${string}` | `Directory-${string}` | `Settings-${string}` | `FAQ-${string}` | `Secret-${string}` | `Note-${string}`;
+    readonly ids: () => (`Agent-${string}` | `Brain-${string}` | `Message-${string}` | `Thread-${string}` | `Relation-${string}` | `Artifact-${string}` | `Flow-${string}` | `Node-${string}` | `TNode-${string}` | `Prompt-${string}` | `Action-${string}` | `Document-${string}` | `Collection-${string}` | `SearchIndex-${string}` | `IndexedDoc-${string}` | `Terminal-${string}` | `Directory-${string}` | `Settings-${string}` | `FAQ-${string}` | `Secret-${string}` | `Note-${string}` | `BrowserTab-${string}` | `BrowserBookmark-${string}` | `CalendarEvent-${string}`)[];
+    readonly id: () => `Agent-${string}` | `Brain-${string}` | `Message-${string}` | `Thread-${string}` | `Relation-${string}` | `Artifact-${string}` | `Flow-${string}` | `Node-${string}` | `TNode-${string}` | `Prompt-${string}` | `Action-${string}` | `Document-${string}` | `Collection-${string}` | `SearchIndex-${string}` | `IndexedDoc-${string}` | `Terminal-${string}` | `Directory-${string}` | `Settings-${string}` | `FAQ-${string}` | `Secret-${string}` | `Note-${string}` | `BrowserTab-${string}` | `BrowserBookmark-${string}` | `CalendarEvent-${string}`;
     readonly count: () => number;
-    readonly first: () => `Agent-${string}` | `Brain-${string}` | `Message-${string}` | `Thread-${string}` | `Relation-${string}` | `Artifact-${string}` | `Flow-${string}` | `Node-${string}` | `TNode-${string}` | `Prompt-${string}` | `Action-${string}` | `Document-${string}` | `Collection-${string}` | `SearchIndex-${string}` | `IndexedDoc-${string}` | `Terminal-${string}` | `Directory-${string}` | `Settings-${string}` | `FAQ-${string}` | `Secret-${string}` | `Note-${string}`;
-    readonly last: () => `Agent-${string}` | `Brain-${string}` | `Message-${string}` | `Thread-${string}` | `Relation-${string}` | `Artifact-${string}` | `Flow-${string}` | `Node-${string}` | `TNode-${string}` | `Prompt-${string}` | `Action-${string}` | `Document-${string}` | `Collection-${string}` | `SearchIndex-${string}` | `IndexedDoc-${string}` | `Terminal-${string}` | `Directory-${string}` | `Settings-${string}` | `FAQ-${string}` | `Secret-${string}` | `Note-${string}` | null;
+    readonly first: () => `Agent-${string}` | `Brain-${string}` | `Message-${string}` | `Thread-${string}` | `Relation-${string}` | `Artifact-${string}` | `Flow-${string}` | `Node-${string}` | `TNode-${string}` | `Prompt-${string}` | `Action-${string}` | `Document-${string}` | `Collection-${string}` | `SearchIndex-${string}` | `IndexedDoc-${string}` | `Terminal-${string}` | `Directory-${string}` | `Settings-${string}` | `FAQ-${string}` | `Secret-${string}` | `Note-${string}` | `BrowserTab-${string}` | `BrowserBookmark-${string}` | `CalendarEvent-${string}`;
+    readonly last: () => `Agent-${string}` | `Brain-${string}` | `Message-${string}` | `Thread-${string}` | `Relation-${string}` | `Artifact-${string}` | `Flow-${string}` | `Node-${string}` | `TNode-${string}` | `Prompt-${string}` | `Action-${string}` | `Document-${string}` | `Collection-${string}` | `SearchIndex-${string}` | `IndexedDoc-${string}` | `Terminal-${string}` | `Directory-${string}` | `Settings-${string}` | `FAQ-${string}` | `Secret-${string}` | `Note-${string}` | `BrowserTab-${string}` | `BrowserBookmark-${string}` | `CalendarEvent-${string}` | null;
     readonly exists: () => boolean;
     readonly map: <T>(fn: (i: EARS.EntityId) => T) => T[];
     readonly forEach: (fn: (i: EARS.EntityId) => void) => {
@@ -4997,16 +5550,16 @@ declare const qx: (seed?: EARS.EntityId | EARS.Entity | readonly EARS.Entity[] |
         readonly reverse: () => /*elided*/ any;
         readonly limit: (n: number) => /*elided*/ any;
         readonly page: (size: number, cursor?: string | null) => {
-            readonly items: (`Agent-${string}` | `Brain-${string}` | `Message-${string}` | `Thread-${string}` | `Relation-${string}` | `Artifact-${string}` | `Flow-${string}` | `Node-${string}` | `TNode-${string}` | `Prompt-${string}` | `Action-${string}` | `Document-${string}` | `Collection-${string}` | `SearchIndex-${string}` | `IndexedDoc-${string}` | `Terminal-${string}` | `Directory-${string}` | `Settings-${string}` | `FAQ-${string}` | `Secret-${string}` | `Note-${string}`)[];
+            readonly items: (`Agent-${string}` | `Brain-${string}` | `Message-${string}` | `Thread-${string}` | `Relation-${string}` | `Artifact-${string}` | `Flow-${string}` | `Node-${string}` | `TNode-${string}` | `Prompt-${string}` | `Action-${string}` | `Document-${string}` | `Collection-${string}` | `SearchIndex-${string}` | `IndexedDoc-${string}` | `Terminal-${string}` | `Directory-${string}` | `Settings-${string}` | `FAQ-${string}` | `Secret-${string}` | `Note-${string}` | `BrowserTab-${string}` | `BrowserBookmark-${string}` | `CalendarEvent-${string}`)[];
             readonly nextCursor: string | null;
         };
         readonly distinct: (field?: string) => /*elided*/ any;
         readonly groupBy: (field: string) => Map<unknown, /*elided*/ any>;
-        readonly ids: () => (`Agent-${string}` | `Brain-${string}` | `Message-${string}` | `Thread-${string}` | `Relation-${string}` | `Artifact-${string}` | `Flow-${string}` | `Node-${string}` | `TNode-${string}` | `Prompt-${string}` | `Action-${string}` | `Document-${string}` | `Collection-${string}` | `SearchIndex-${string}` | `IndexedDoc-${string}` | `Terminal-${string}` | `Directory-${string}` | `Settings-${string}` | `FAQ-${string}` | `Secret-${string}` | `Note-${string}`)[];
-        readonly id: () => `Agent-${string}` | `Brain-${string}` | `Message-${string}` | `Thread-${string}` | `Relation-${string}` | `Artifact-${string}` | `Flow-${string}` | `Node-${string}` | `TNode-${string}` | `Prompt-${string}` | `Action-${string}` | `Document-${string}` | `Collection-${string}` | `SearchIndex-${string}` | `IndexedDoc-${string}` | `Terminal-${string}` | `Directory-${string}` | `Settings-${string}` | `FAQ-${string}` | `Secret-${string}` | `Note-${string}`;
+        readonly ids: () => (`Agent-${string}` | `Brain-${string}` | `Message-${string}` | `Thread-${string}` | `Relation-${string}` | `Artifact-${string}` | `Flow-${string}` | `Node-${string}` | `TNode-${string}` | `Prompt-${string}` | `Action-${string}` | `Document-${string}` | `Collection-${string}` | `SearchIndex-${string}` | `IndexedDoc-${string}` | `Terminal-${string}` | `Directory-${string}` | `Settings-${string}` | `FAQ-${string}` | `Secret-${string}` | `Note-${string}` | `BrowserTab-${string}` | `BrowserBookmark-${string}` | `CalendarEvent-${string}`)[];
+        readonly id: () => `Agent-${string}` | `Brain-${string}` | `Message-${string}` | `Thread-${string}` | `Relation-${string}` | `Artifact-${string}` | `Flow-${string}` | `Node-${string}` | `TNode-${string}` | `Prompt-${string}` | `Action-${string}` | `Document-${string}` | `Collection-${string}` | `SearchIndex-${string}` | `IndexedDoc-${string}` | `Terminal-${string}` | `Directory-${string}` | `Settings-${string}` | `FAQ-${string}` | `Secret-${string}` | `Note-${string}` | `BrowserTab-${string}` | `BrowserBookmark-${string}` | `CalendarEvent-${string}`;
         readonly count: () => number;
-        readonly first: () => `Agent-${string}` | `Brain-${string}` | `Message-${string}` | `Thread-${string}` | `Relation-${string}` | `Artifact-${string}` | `Flow-${string}` | `Node-${string}` | `TNode-${string}` | `Prompt-${string}` | `Action-${string}` | `Document-${string}` | `Collection-${string}` | `SearchIndex-${string}` | `IndexedDoc-${string}` | `Terminal-${string}` | `Directory-${string}` | `Settings-${string}` | `FAQ-${string}` | `Secret-${string}` | `Note-${string}`;
-        readonly last: () => `Agent-${string}` | `Brain-${string}` | `Message-${string}` | `Thread-${string}` | `Relation-${string}` | `Artifact-${string}` | `Flow-${string}` | `Node-${string}` | `TNode-${string}` | `Prompt-${string}` | `Action-${string}` | `Document-${string}` | `Collection-${string}` | `SearchIndex-${string}` | `IndexedDoc-${string}` | `Terminal-${string}` | `Directory-${string}` | `Settings-${string}` | `FAQ-${string}` | `Secret-${string}` | `Note-${string}` | null;
+        readonly first: () => `Agent-${string}` | `Brain-${string}` | `Message-${string}` | `Thread-${string}` | `Relation-${string}` | `Artifact-${string}` | `Flow-${string}` | `Node-${string}` | `TNode-${string}` | `Prompt-${string}` | `Action-${string}` | `Document-${string}` | `Collection-${string}` | `SearchIndex-${string}` | `IndexedDoc-${string}` | `Terminal-${string}` | `Directory-${string}` | `Settings-${string}` | `FAQ-${string}` | `Secret-${string}` | `Note-${string}` | `BrowserTab-${string}` | `BrowserBookmark-${string}` | `CalendarEvent-${string}`;
+        readonly last: () => `Agent-${string}` | `Brain-${string}` | `Message-${string}` | `Thread-${string}` | `Relation-${string}` | `Artifact-${string}` | `Flow-${string}` | `Node-${string}` | `TNode-${string}` | `Prompt-${string}` | `Action-${string}` | `Document-${string}` | `Collection-${string}` | `SearchIndex-${string}` | `IndexedDoc-${string}` | `Terminal-${string}` | `Directory-${string}` | `Settings-${string}` | `FAQ-${string}` | `Secret-${string}` | `Note-${string}` | `BrowserTab-${string}` | `BrowserBookmark-${string}` | `CalendarEvent-${string}` | null;
         readonly exists: () => boolean;
         readonly map: <T>(fn: (i: EARS.EntityId) => T) => T[];
         readonly forEach: /*elided*/ any;
@@ -5136,7 +5689,6 @@ declare class BrowserService {
 declare function createBrowser(browserType?: BrowserType): BrowserService;
 
 declare const browser_Browser: typeof Browser;
-declare const browser_BrowserContext: typeof BrowserContext;
 type browser_BrowserService = BrowserService;
 declare const browser_BrowserService: typeof BrowserService;
 type browser_LaunchOptions = LaunchOptions;
@@ -5146,7 +5698,7 @@ declare const browser_createBrowser: typeof createBrowser;
 declare const browser_firefox: typeof firefox;
 declare const browser_webkit: typeof webkit;
 declare namespace browser {
-  export { browser_Browser as Browser, browser_BrowserContext as BrowserContext, browser_BrowserService as BrowserService, browser_Page as Page, browser_chromium as chromium, browser_createBrowser as createBrowser, browser_firefox as firefox, browser_webkit as webkit };
+  export { browser_Browser as Browser, BrowserContext as BrowserContext, browser_BrowserService as BrowserService, browser_Page as Page, browser_chromium as chromium, browser_createBrowser as createBrowser, browser_firefox as firefox, browser_webkit as webkit };
   export type { browser_LaunchOptions as LaunchOptions };
 }
 
@@ -5529,6 +6081,7 @@ interface CreateArtifactOptions {
     title: string;
     content: any;
     threadId?: EARS.EntityId;
+    color?: string;
 }
 interface UpdateArtifactOptions {
     title?: string;
@@ -5576,6 +6129,7 @@ declare function updateAndNotify(artifactId: EARS.EntityId, options: UpdateArtif
 declare function findOrCreateByType(threadId: EARS.EntityId, artifactType: ArtifactType, initial: {
     title: string;
     content: any;
+    color?: string;
 }): {
     artifactId: EARS.EntityId;
     created: boolean;
@@ -5741,431 +6295,7 @@ declare const services: {
     action: ActionService;
     library: LibraryService;
     browser: typeof browser;
-    repository: {
-        readonly actionQueries: {
-            readonly byId: (id: EARS.EntityId) => ActionEntity | undefined;
-            readonly all: () => ActionEntity[];
-            readonly byCategory: (category: string) => ActionEntity[];
-            readonly paginated: (page?: number, pageSize?: number) => {
-                items: ActionEntity[];
-                page: number;
-                pageSize: number;
-                totalCount: number;
-                totalPages: number;
-            };
-            readonly connectedData: (page?: number) => {
-                actions: ActionEntity[];
-                page: number;
-                totalPages: number;
-                totalCount: number;
-            };
-        };
-        readonly actionCommands: {
-            readonly create: (data: {
-                label: string;
-                description?: string;
-                category?: string;
-                input?: Record<string, any>;
-                actionFn: string;
-                output?: any;
-                sourceHash?: string;
-            }) => ActionEntity;
-            readonly update: (id: EARS.EntityId, updates: {
-                label?: string;
-                description?: string;
-                category?: string;
-                input?: Record<string, any>;
-                actionFn?: string;
-                output?: any;
-                sourceHash?: string;
-            }) => void;
-            readonly delete: (id: EARS.EntityId) => void;
-        };
-        readonly chatQueries: {
-            readonly hasRequiredApiKeys: () => boolean;
-            readonly threadArtifacts: (threadId: EARS.EntityId) => ArtifactItem[];
-            readonly threadMessages: (threadId: EARS.EntityId, pageSize?: number, cursor?: string | null) => {
-                messages: Partial<MessageEntity>[];
-                nextCursor: string | null;
-                hasMore: boolean;
-            };
-            readonly threadData: (threadId: EARS.EntityId) => AgentThreadData;
-            readonly refreshThreadsData: () => RecentThreadRefreshData;
-            readonly connectedData: () => AgentConnectedData;
-            readonly messageById: (messageId: EARS.EntityId) => MessageEntity | null;
-        };
-        readonly chatCommands: {
-            readonly addMessage: (params: {
-                threadId: EARS.EntityId;
-                text: string;
-                sender: "user" | "assistant" | "system" | "marker";
-                blocks?: BlockConfig[];
-                forkable?: boolean;
-                references?: MessageReferences;
-                isCommand?: boolean;
-                command?: string;
-                autoHide?: boolean;
-                asUser?: boolean;
-                asideContext?: string;
-                blockResponse?: any;
-                responseTimestamp?: number;
-                asideText?: string;
-                compacted?: boolean;
-                context?: Record<string, unknown>;
-                skipRelink?: boolean;
-            }) => {
-                id: EARS.EntityId;
-                threadId: EARS.EntityId;
-                text: string;
-                sender: string;
-                timestamp: number;
-            };
-            readonly createThreadFromMessage: (text: string) => {
-                threadId: EARS.EntityId;
-                threadData: ReturnType<(input: ThreadCreateData & {
-                    id?: string;
-                }) => {
-                    id: EARS.EntityId;
-                    shortCode: string;
-                    timestamp: number;
-                    status: string;
-                }>;
-            };
-            readonly updateMessageBlockResponse: (params: {
-                messageId: EARS.EntityId;
-                response: any;
-            }) => {
-                messageId: EARS.EntityId;
-                responseTimestamp: number;
-                updatedAt: number;
-                blocks?: BlockConfig[];
-            };
-            readonly updateMessageState: (params: {
-                messageId: EARS.EntityId;
-                updates: Partial<Pick<MessageEntity, "text" | "blocks" | "blockResponse" | "responseTimestamp" | "forkable" | "status" | "context" | "compacted">>;
-            }) => {
-                messageId: EARS.EntityId;
-                updatedAt: number;
-                updates: typeof params.updates;
-            };
-            readonly createMarkerMessage: (params: {
-                threadId: EARS.EntityId;
-                text: string;
-            }) => {
-                id: EARS.EntityId;
-                threadId: EARS.EntityId;
-                text: string;
-                sender: string;
-                timestamp: number;
-                compactedMessageIds: EARS.EntityId[];
-            };
-            readonly toggleMarkerCompacted: (markerId: EARS.EntityId, compacted: boolean) => EARS.EntityId[];
-            readonly copyMessagesUpTo: (params: {
-                sourceThreadId: EARS.EntityId;
-                targetThreadId: EARS.EntityId;
-                upToMessageId: string;
-            }) => void;
-            readonly softDeleteMessagesAfter: (params: {
-                threadId: EARS.EntityId;
-                messageId: EARS.EntityId;
-            }) => {
-                deletedCount: number;
-                deletedIds: string[];
-            };
-            readonly createArtifact: (params: {
-                artifactType: ArtifactType;
-                title: string;
-                content: any;
-                threadId?: EARS.EntityId;
-            }) => {
-                artifactId: EARS.EntityId;
-            };
-            readonly updateArtifact: (artifactId: EARS.EntityId, patch: {
-                title?: string;
-                content?: unknown;
-            }) => void;
-            readonly findArtifactByType: (threadId: EARS.EntityId, artifactType: ArtifactType) => ArtifactEntity | undefined;
-        };
-        readonly brainQueries: {
-            readonly rootFlowTNode: () => EARS.EntityId | undefined;
-            readonly tNodeById: (id: EARS.EntityId) => TNodeEntity | null;
-            readonly flowEventNodes: (flowId: EARS.EntityId) => ListenerNode[];
-            readonly eventFirstStep: (eventNodeId: EARS.EntityId) => NodeEntity | undefined;
-            readonly eventAllSteps: (eventNodeId: EARS.EntityId) => NodeEntity[];
-            readonly nextNodeInFlowTrack: (nodeId: EARS.EntityId) => NodeEntity;
-            readonly nextNodeForBranch: (nodeId: EARS.EntityId, sourceHandle?: string) => NodeEntity | undefined;
-            readonly eventTracks: (flowTNodeId: EARS.EntityId) => TrackEntity[];
-            readonly possibleEvents: (flowTNodeId: EARS.EntityId) => EventListenerEntity[];
-            readonly buildFlowHierarchy: (flowTNodeId: EARS.EntityId) => Array<{
-                flowTNodeId: EARS.EntityId;
-                label: string;
-            }>;
-            readonly extendedTNodeData: (tNodeId: EARS.EntityId) => FlowTNodeData;
-            readonly rootData: () => FlowTNodeData;
-        };
-        readonly brainCommands: {
-            readonly createEventTNode: (eventNode: ListenerNode, flowTNodeId: EARS.EntityId) => TNodeEntity;
-            readonly createFlowTNode: (flowStepId: EARS.EntityId, eventTrackId?: EARS.EntityId, executionContext?: ExecutionContext) => {
-                flowTNode: TNodeEntity;
-                eventNodes: ListenerNode[];
-            };
-            readonly createStepTNode: (stepId: EARS.EntityId, eventTrackId: EARS.EntityId, executionContext?: ExecutionContext) => {
-                tNode: TNodeEntity;
-                step: NodeEntity;
-            };
-            readonly createRootFlowTNode: () => {
-                rootFlow: FlowEntity;
-                rootFlowTNode: TNodeEntity;
-                eventNodes: ListenerNode[];
-                entryNode: ListenerNode;
-            };
-            readonly updateTNodeStatus: (tNodeId: EARS.EntityId, status: TNodeEntity["status"]) => void;
-            readonly updateTNodeResult: (tNodeId: EARS.EntityId, result: any) => void;
-            readonly updateTNodeAttributes: (tNodeId: EARS.EntityId, attributes: any) => void;
-            readonly clearVolatileData: () => void;
-        };
-        readonly flowsQueries: {
-            readonly rootFlow: () => EARS.EntityId | undefined;
-            readonly getNodeActionId: (nodeId: EARS.EntityId) => EARS.EntityId | undefined;
-            readonly node: (nodeId: EARS.EntityId) => NodeEntity | undefined;
-            readonly flowNodes: (flowId: EARS.EntityId) => NodeEntity[];
-            readonly flowEdges: (flowId: EARS.EntityId) => EdgeEntity[];
-            readonly extendedData: (flowId: EARS.EntityId, include?: keyof FlowExtendedData | (keyof FlowExtendedData)[]) => FlowExtendedData;
-            readonly connectedData: () => FlowsConnectedData;
-        };
-        readonly flowsCommands: {
-            readonly createFlow: (flow?: Partial<FlowEntity>) => FlowEntity;
-            readonly createFlowWithEntryNode: (flow?: Partial<FlowEntity>) => {
-                flow: FlowEntity;
-                entryNode: NodeEntity;
-            };
-            readonly createNode: (flowId: EARS.EntityId, nodeData: NodeCreateInput) => NodeEntity;
-            readonly createEdge: (sourceId: EARS.EntityId, targetId: EARS.EntityId, options?: {
-                sourceHandle?: string;
-                targetHandle?: string;
-            }) => {
-                relId: EARS.EntityId;
-            };
-            readonly updateFlowLabel: (flowId: EARS.EntityId, label: string) => void;
-            readonly updateNode: (nodeId: EARS.EntityId, updates: NodeCreateInput) => void;
-            readonly deleteNode: (nodeId: EARS.EntityId) => void;
-            readonly deleteEdge: (edgeId: EARS.EntityId) => void;
-            readonly updateEdge: (edgeId: EARS.EntityId, oldSource: EARS.EntityId, oldTarget: EARS.EntityId, newSource: EARS.EntityId, newTarget: EARS.EntityId) => {
-                newRelId: EARS.EntityId;
-            };
-            readonly grantRootFlowRole: (flowId: EARS.EntityId) => void;
-            readonly revokeRootFlowRole: (flowId: EARS.EntityId) => void;
-            readonly deleteFlow: (flowId: EARS.EntityId) => void;
-            readonly reindexHandles: (nodeId: EARS.EntityId, prefix: string, pivotIndex: number, direction: 1 | -1) => void;
-            readonly importFromDSL: (compiled: CompiledRows) => {
-                flowIds: EARS.EntityId[];
-            };
-        };
-        readonly libraryQueries: {
-            readonly getDocuments: (collectionId?: string) => DocumentDTO[];
-            readonly getDocument: (id: EARS.EntityId) => DocumentDTO | null;
-            readonly getDocumentByShortCode: (shortCode: DocumentShortCode) => DocumentDTO | null;
-            readonly getCollections: () => CollectionDTO[];
-            readonly getFolderContents: (folderId: EARS.EntityId | null) => Promise<FolderContents>;
-            readonly getFolderPath: (folderId: EARS.EntityId | null) => BreadcrumbItem[];
-            readonly getParentFolderId: (folderId: EARS.EntityId) => EARS.EntityId | null;
-            readonly getCollectionByName: (name: string) => CollectionDTO | null;
-            readonly getDocumentsInCollection: (collectionId: EARS.EntityId) => DocumentDTO[];
-            readonly getAllDocuments: () => DocumentDTO[];
-        };
-        readonly libraryCommands: {
-            readonly createDocument: (name: string, content: ContentSection[], tags: string[], collectionId?: EARS.EntityId, id?: string, sourceHash?: string) => DocumentDTO;
-            readonly updateDocument: (id: EARS.EntityId, name: string, content: ContentSection[], tags: string[], collectionId?: EARS.EntityId, sourceHash?: string) => DocumentDTO;
-            readonly deleteDocument: (id: EARS.EntityId) => void;
-            readonly createCollection: (name: string, description?: string, parentId?: EARS.EntityId, id?: string, sourceHash?: string) => CollectionDTO;
-            readonly updateCollection: (id: EARS.EntityId, name: string, description?: string, sourceHash?: string) => CollectionDTO;
-            readonly deleteCollection: (id: EARS.EntityId) => void;
-            readonly moveDocument: (documentId: EARS.EntityId, newCollectionId?: EARS.EntityId) => DocumentDTO;
-            readonly renameItem: (id: EARS.EntityId, name: string, type: "document" | "folder") => LibraryItem;
-            readonly deleteItems: (ids: EARS.EntityId[]) => void;
-            readonly moveItems: (ids: EARS.EntityId[], targetFolderId: EARS.EntityId | null) => void;
-            readonly migrateDocumentShortCodes: () => void;
-            readonly migrateDisplayOrders: () => void;
-            readonly createSymlinkCollection: (name: string, symlinkPath: string, parentId?: EARS.EntityId, id?: string) => CollectionDTO;
-            readonly updateSymlinkPath: (collectionId: EARS.EntityId, newPath: string) => CollectionDTO;
-            readonly updateDocumentTags: (documentId: EARS.EntityId, tags: string[]) => void;
-        };
-        readonly promptQueries: {
-            byId: (id: EARS.EntityId) => PromptEntity | undefined;
-            all: () => PromptEntity[];
-            byLabel: (label: string) => PromptEntity | undefined;
-            connectedData: (page?: number, pageSize?: number) => {
-                prompts: PromptEntity[];
-                page: number;
-                totalPages: number;
-                totalCount: number;
-            };
-        };
-        readonly promptCommands: {
-            create: (input: {
-                label: string;
-                description?: string;
-                templateFn: string;
-                inputs?: Record<string, any>;
-                category?: string;
-                sourceHash?: string;
-            }) => PromptEntity;
-            update: (id: EARS.EntityId, updates: {
-                label?: string;
-                description?: string;
-                templateFn?: string;
-                inputs?: Record<string, any>;
-                category?: string;
-                sourceHash?: string;
-            }) => void;
-            delete: (id: EARS.EntityId) => void;
-        };
-        readonly settingsQueries: {
-            getSettings: () => SettingsData;
-            getGeneralSettings: (label?: string) => any;
-            getInternalSettings: () => InternalSettings;
-            getAssistantSettings: () => AssistantSettings;
-            getPluginSettings: (pluginId: string) => any;
-        };
-        readonly settingsCommands: {
-            updateSettings(type: string, label: string | null, path: string[], value: any): void;
-            resetSettings: () => void;
-        };
-        readonly secretsQueries: {
-            getAllSecrets: () => SecretEntity[];
-            getSecret: (id: EARS.EntityId) => SecretEntity | null;
-            getSecretByProvider: (provider: SecretProvider, customName?: string) => SecretEntity | null;
-            getSecretsData: () => SecretData[];
-        };
-        readonly secretsCommands: {
-            createSecret: (params: CreateSecretParams) => EARS.EntityId;
-            updateSecret: (id: EARS.EntityId, value: string) => EARS.EntityId;
-            deleteSecret: (id: EARS.EntityId) => boolean;
-            deleteSecretByProvider: (provider: SecretProvider, customName?: string) => boolean;
-        };
-        readonly terminalQueries: {
-            byId: (id: EARS.EntityId) => TerminalEntity | undefined;
-            all: () => TerminalEntity[];
-            active: () => TerminalEntity[];
-            getStartupData: () => StartupData;
-        };
-        readonly terminalCommands: {
-            create: (terminalInfo: Partial<TerminalInfo> & {
-                id: EARS.EntityId;
-            }) => EARS.EntityId;
-            resize: (id: EARS.EntityId, cols: number, rows: number) => void;
-            rename: (id: EARS.EntityId, customTitle: string) => void;
-            updateCwd: (id: EARS.EntityId, cwd: string, title?: string) => void;
-            updatePid: (id: EARS.EntityId, pid: number) => void;
-            markClosed: (id: EARS.EntityId) => void;
-            delete: (id: EARS.EntityId) => void;
-        };
-        readonly threadQueries: {
-            readonly byId: (id: EARS.EntityId) => ThreadEntity | undefined;
-            readonly all: () => ThreadEntity[];
-            readonly allByRecency: () => ThreadEntity[];
-            readonly messages: (threadId: EARS.EntityId) => Partial<MessageEntity>[];
-            readonly linkedThreads: (threadId: EARS.EntityId) => any[];
-            readonly extendedData: (threadId: EARS.EntityId, include?: keyof ThreadExtendedData | (keyof ThreadExtendedData)[]) => ThreadExtendedData;
-            readonly archivedThreads: () => Partial<ThreadEntity>[];
-            readonly kanbanItems: () => {
-                content: {
-                    workItems: {
-                        id: any;
-                        name: string;
-                        time: string;
-                        date: string;
-                        priority: number;
-                        tags: never[];
-                        status: any;
-                        type: "work-item";
-                    }[];
-                };
-                metadata: {
-                    createdAt: number;
-                };
-            };
-            readonly connectedData: () => ThreadConnectedData;
-        };
-        readonly threadCommands: {
-            readonly create: (input: ThreadCreateData & {
-                id?: string;
-            }) => {
-                id: EARS.EntityId;
-                shortCode: string;
-                timestamp: number;
-                status: string;
-            };
-            readonly update: (id: EARS.EntityId, updates: {
-                topic?: string;
-                instructions?: string;
-                status?: string;
-                tags?: string[];
-                linkedThreads?: any[];
-                lastMessageTimestamp?: number;
-                lastVisitedTimestamp?: number;
-                forcedMode?: ThreadEntity["forcedMode"] | null;
-                context?: ThreadEntity["context"];
-                archived?: boolean;
-                chatState?: string;
-            }) => void;
-            readonly markAsVisited: (id: EARS.EntityId) => void;
-            readonly linkFork: (sourceThreadId: EARS.EntityId, forkedThreadId: EARS.EntityId) => void;
-            readonly forkCount: (sourceThreadId: EARS.EntityId) => number;
-            readonly setParent: (parentId: EARS.EntityId, childIds: EARS.EntityId[]) => {
-                reparented: string[];
-                skipped: string[];
-            };
-            readonly delete: (id: EARS.EntityId) => void;
-        };
-        readonly noteQueries: {
-            readonly byId: (id: EARS.EntityId) => NoteEntity | undefined;
-            readonly byIdDTO: (id: EARS.EntityId) => NoteDTO | undefined;
-            readonly all: () => NoteEntity[];
-            readonly allDTOs: () => NoteDTO[];
-            readonly children: (parentId: EARS.EntityId) => NoteDTO[];
-            readonly ancestorChain: (noteId: EARS.EntityId) => NoteDTO[];
-            readonly referencedBy: (noteId: EARS.EntityId) => EARS.EntityId[];
-            readonly trashedDTOs: () => NoteDTO[];
-            readonly expiredSoftDeleted: (maxAgeDays: number) => NoteEntity[];
-            readonly connectedData: () => {
-                notes: NoteDTO[];
-            };
-        };
-        readonly noteCommands: {
-            readonly create: (input: {
-                title: string;
-                content?: string;
-                icon?: string | null;
-                parentId?: string;
-                displayOrder?: number;
-                noteType?: "document" | "tasklist" | "task";
-                completed?: boolean;
-                id?: string;
-            }) => NoteEntity;
-            readonly update: (id: EARS.EntityId, updates: {
-                title?: string;
-                content?: string;
-                icon?: string | null;
-                displayOrder?: number;
-                savedDisplayOrder?: number | null;
-                lastSeen?: number;
-                completed?: boolean;
-                hideCompletedChildren?: boolean;
-                favorite?: boolean;
-            }, skipTimestamp?: boolean) => void;
-            readonly softDelete: (id: EARS.EntityId) => string[];
-            readonly restore: (id: EARS.EntityId) => string[];
-            readonly move: (id: EARS.EntityId, newParentId: EARS.EntityId | null) => {
-                oldParentId: string | null;
-            };
-            readonly reorder: (id: EARS.EntityId, newParentId: EARS.EntityId | null, newIndex: number) => {
-                oldParentId: string | null;
-                affectedIds: string[];
-            };
-            readonly delete: (id: EARS.EntityId) => void;
-        };
-    };
+    repository: any;
     settings: SettingsService;
     textStream: TextStreamService;
     chat: typeof chat;
@@ -6175,83 +6305,100 @@ declare const services: {
     cli: CliServiceType;
     filesystem: FilesystemServiceType;
     threads: typeof threads;
-    hermes: {
-        readonly bridge: HermesBridgeClient;
-        readonly installStatus: InstallStatus;
-        checkInstall(): InstallStatus;
-        install(onProgress?: (msg: string) => void): Promise<void>;
-        start(config?: HermesConfig): Promise<BridgeInfo>;
-        stop(): Promise<void>;
-        updateConfig(config: {
-            provider?: string;
-            apiKey?: string;
-            model?: string;
-        }): Promise<void>;
-        restart(config?: HermesConfig): Promise<BridgeInfo>;
-        readonly info: BridgeInfo;
-        health(): Promise<{
-            status: string;
-            agent_available: boolean;
+    codex: {
+        start: () => Promise<void>;
+        stop: () => Promise<void>;
+        restart: () => Promise<void>;
+        readonly status: ServerStatus;
+        startThread: (params: ThreadStartParams) => Promise<{
+            threadId: string;
+            model: string;
+            cwd: string;
         }>;
-        sessions: {
-            list(): Promise<HermesSession[]>;
-            get(sessionId: string): Promise<Record<string, unknown>>;
-            create(opts?: {
-                model?: string;
-                workspace?: string;
-                title?: string;
-            }): Promise<Record<string, unknown>>;
-        };
-        chat(params: {
-            sessionId?: string;
-            message: string;
-            model?: string;
-            workspace?: string;
-        }, onEvent: (type: string, data: Record<string, unknown>) => void): Promise<Record<string, unknown>>;
-        cancelStream(streamId: string): Promise<{
-            cancelled: boolean;
+        resumeThread: (threadId: string, params?: Partial<ThreadStartParams>) => Promise<{
+            threadId: string;
         }>;
-        models: {
-            list(): Promise<HermesModel[]>;
-        };
-        skills: {
-            list(): Promise<HermesSkill[]>;
-            save(skill: {
-                name: string;
-                category?: string;
-                content: string;
-            }): Promise<{
-                saved: boolean;
-                path: string;
-            }>;
-            delete(skillPath: string): Promise<{
-                deleted: boolean;
-            }>;
-        };
-        memory: {
-            get(): Promise<HermesMemoryFiles>;
-            write(filename: string, content: string): Promise<{
-                written: boolean;
-            }>;
-        };
-        tools: {
-            list(): Promise<{
-                tools: HermesTool[];
-                enabledToolsets: string[];
-            }>;
-        };
-        persona: {
-            get(): Promise<{
-                content: string;
-                path: string;
-            }>;
-            update(content: string): Promise<{
-                written: boolean;
-            }>;
-        };
-        workspaces: {
-            list(): Promise<string[]>;
-        };
+        readThread: (threadId: string, params?: ThreadReadParams) => Promise<{
+            thread: any;
+        }>;
+        forkThread: (params: ThreadForkParams) => Promise<{
+            threadId: string;
+            model: string;
+            cwd: string;
+            thread: any;
+        }>;
+        rollbackThread: (params: ThreadRollbackParams) => Promise<{
+            thread: any;
+        }>;
+        compactThread: (threadId: string) => Promise<void>;
+        listThreads: (params?: ThreadListParams) => Promise<{
+            data: any[];
+            nextCursor: string | null;
+            backwardsCursor: string | null;
+        }>;
+        setThreadName: (threadId: string, name: string) => Promise<void>;
+        readConfig: (params?: ConfigReadParams) => Promise<any>;
+        writeConfigValue: (params: ConfigValueWriteParams) => Promise<any>;
+        listModels: (params?: {
+            cursor?: string | null;
+            limit?: number | null;
+            includeHidden?: boolean;
+        }) => Promise<any>;
+        readAccount: (params?: {
+            refreshToken: boolean;
+        }) => Promise<any>;
+        listSkills: (params?: {
+            cwds?: string[];
+            forceReload?: boolean;
+        }) => Promise<any>;
+        listMcpServers: (params?: {
+            cursor?: string | null;
+            limit?: number | null;
+            detail?: "full" | "toolsAndAuthOnly" | null;
+        }) => Promise<any>;
+        startTurn: (params: TurnStartParams) => Promise<{
+            turnId: string;
+        }>;
+        interruptTurn: (threadId: string, turnId: string) => Promise<void>;
+        respondToApproval: (requestId: number, decision: ApprovalDecision) => void;
+        registerConsumer: (codexThreadId: string, handlers: ConsumerHandlers) => void;
+        unregisterConsumer: (codexThreadId: string) => void;
+        storeHandle: typeof storeHandle;
+        getHandle: typeof getHandle;
+        clearHandle: typeof clearHandle;
+        listAllSessions: typeof listAll;
+        viewSessionByFile: typeof viewByFile;
+    };
+    modelClient: {
+        createConversation(config: ConversationConfig): Conversation;
+        streamTurn: (params: TurnParams & ModelClientConfig) => AsyncGenerator<StreamEvent>;
+        generateTurn: (params: TurnParams & ModelClientConfig) => Promise<TurnResult>;
+        defineTool: typeof defineTool;
+        webSearchTool: typeof webSearchTool;
+        compact(params: CompactParams, config: ModelClientConfig): Promise<CompactResult>;
+        shellTool: typeof shellTool;
+        readFileTool: typeof readFileTool;
+        writeFileTool: typeof writeFileTool;
+        grepTool: typeof grepTool;
+        listDirTool: typeof listDirTool;
+        patchTool: typeof patchTool;
+        planTool: typeof planTool;
+        goalTool: typeof goalTool;
+        userInputTool: typeof userInputTool;
+        viewImageTool: typeof viewImageTool;
+        codingAgentTools: typeof codingAgentTools;
+        createChatApprover: typeof createChatApprover;
+    };
+    openaiAuth: {
+        login(): Promise<AuthState>;
+        logout(): Promise<void>;
+        getCredentials(): Promise<{
+            accessToken: string;
+            accountId: string;
+        } | null>;
+        status(): Promise<AuthState | null>;
+        isAuthenticated(): Promise<boolean>;
+        clearAuth(): Promise<void>;
     };
 };
 
@@ -6269,5 +6416,5 @@ type Services = typeof services;
 declare const services: Services;
 declare const params: ActionParams;
 
-export { ActionService, LibraryService, PromptService, params as params, services };
+export { ActionService, LibraryService, PromptService, params, services };
 export type { ActionEntity, ActionParams, Services, SettingsData };

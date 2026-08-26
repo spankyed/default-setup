@@ -63,6 +63,8 @@ export interface ConsumerContext {
   revertCliUuid?: string;
   /** The --resume-session-at value when forking. */
   forkCliUuid?: string;
+  /** Whether this turn was invoked with --worktree. */
+  useWorktree?: boolean;
 }
 
 export interface ConsumerWriters {
@@ -97,6 +99,7 @@ export async function consumeStream(
   let writer = initialWriters.writer;
   let toolActivity = initialWriters.toolActivity;
   let thinking = initialWriters.thinking;
+  let currentMessageHasCliUuid = false;
 
   /** Idempotent — safe to call from every finalization path. */
   const finaliseThinking = () => { if (thinking.isStreaming) thinking.finalise(); };
@@ -121,7 +124,7 @@ export async function consumeStream(
   function splitMessage() {
     writer.finalize(writer.text);
     finaliseThinking();
-    services.chat.updateMessageState(currentMessageId as any, { forkable: true } as any);
+    services.chat.updateMessageState(currentMessageId as any, { forkable: currentMessageHasCliUuid } as any);
     const segmentHadErrors = toolActivity.entries.some(e => e.status === 'error');
     toolActivity.finalise(segmentHadErrors ? 'error' : 'done');
 
@@ -133,6 +136,7 @@ export async function consumeStream(
       writer: createStreamWriter(services, msg.messageId as EntityId, { intervalMs: 80 }),
       toolActivity: createToolActivityWriter(services, msg.messageId as EntityId, { intervalMs: 250, phase, getThinkingBlock: () => newThinking.buildBlock() }),
       thinking: newThinking,
+      currentMessageHasCliUuid: false,
     };
   }
 
@@ -154,7 +158,7 @@ export async function consumeStream(
       const isMessageStart = line.type === 'assistant' || (line.type === 'stream_event' && (line as any).event?.type === 'message_start');
       if (splitOnNextMessageStart && isMessageStart) {
         splitOnNextMessageStart = false;
-        ({ currentMessageId, writer, toolActivity, thinking } = splitMessage());
+        ({ currentMessageId, writer, toolActivity, thinking, currentMessageHasCliUuid } = splitMessage());
       }
 
       // First `system/init` event carries sessionId/model/cwd.
@@ -167,6 +171,7 @@ export async function consumeStream(
             sessionId: line.session_id,
             lastTurnAt: Date.now(),
             cwd: line.cwd || undefined,
+            sessionWorktree: ctx.useWorktree ?? false,
           });
         }
         services.emitter.sendToBrainSystem({
@@ -220,6 +225,7 @@ export async function consumeStream(
           services.chat.updateMessageState(currentMessageId as any, {
             context: { cliUuid: line.uuid },
           } as any);
+          currentMessageHasCliUuid = true;
         }
         const blocks = line.message?.content || [];
         for (const block of blocks) {
@@ -345,7 +351,7 @@ export async function consumeStream(
         }
 
         // Auto-approve plan-file writes during plan phase.
-        if (phase === 'plan' && req.subtype === 'can_use_tool' && isPlanFileWrite(req.tool_name, req.input)) {
+        if (phase === 'Plan' && req.subtype === 'can_use_tool' && isPlanFileWrite(req.tool_name, req.input)) {
           log.debug('auto-approved plan-file write', { tool: req.tool_name });
           handle.respond(requestId, { behavior: 'allow', updatedInput: req.input });
           continue;
@@ -422,7 +428,7 @@ export async function consumeStream(
           if (questions.length > 0) {
             const questionMsg = (services.chat as any).sendQuestionBlock({
               threadId,
-              text: questions[0].question,
+              text: questions[0].header || 'Select an option',
               prompt: questions[0].header || 'Select an option',
               questions: questions.map(q => ({
                 question: q.question,
@@ -475,7 +481,7 @@ export async function consumeStream(
 
         splitOnNextMessageStart = true;
         // After plan approval, the agent transitions to the edit phase.
-        if (req.tool_name === 'ExitPlanMode') phase = 'edit';
+        if (req.tool_name === 'ExitPlanMode') phase = 'Edit';
         // Emit to flow → CC: Stream Paused action updates artifact status.
         services.emitter.sendToBrainSystem({
           eventType: 'cc.stream.paused',
@@ -573,11 +579,11 @@ export async function consumeStream(
         forkCliUuid: ctx.forkCliUuid ?? null,
       });
 
-      finalizeSessionError(services, threadId, writer, errorText);
+      finalizeSessionError(services, threadId, writer, errorText, undefined, { isRevert: !!ctx.revertCliUuid });
 
       finaliseThinking();
       toolActivity.finalise('error');
-      services.chat.updateMessageState(currentMessageId as any, { forkable: true } as any);
+      services.chat.updateMessageState(currentMessageId as any, { forkable: currentMessageHasCliUuid } as any);
     } else {
       // Critical state: persist sessionId for resume.
       if (result.sessionId) {
@@ -599,11 +605,11 @@ export async function consumeStream(
       // placeholder with an empty string.
       if (writer.text || result.text) {
         writer.finalize(writer.text || result.text);
-        services.chat.updateMessageState(currentMessageId as any, { forkable: true } as any);
+        services.chat.updateMessageState(currentMessageId as any, { forkable: currentMessageHasCliUuid } as any);
       } else {
         services.chat.updateMessageState(currentMessageId as any, {
           responseTimestamp: Date.now(),
-          forkable: true,
+          forkable: currentMessageHasCliUuid,
         } as any);
       }
     }
@@ -673,7 +679,7 @@ export async function consumeStream(
       toolActivity.finalise('done');
       services.chat.updateMessageState(currentMessageId as any, {
         responseTimestamp: Date.now(),
-        forkable: true,
+        forkable: currentMessageHasCliUuid,
       } as any);
       return;
     }
@@ -688,13 +694,13 @@ export async function consumeStream(
       toolActivity.finalise(segmentHadErrors ? 'error' : 'done');
       if (writer.text) {
         writer.finalize(writer.text);
-        services.chat.updateMessageState(currentMessageId as any, { forkable: true } as any);
+        services.chat.updateMessageState(currentMessageId as any, { forkable: currentMessageHasCliUuid } as any);
       } else {
         // Nothing streamed — don't let the writer overwrite the "Thinking…"
         // placeholder with its empty buffer. Mark the message complete in one shot.
         services.chat.updateMessageState(currentMessageId as any, {
           responseTimestamp: Date.now(),
-          forkable: true,
+          forkable: currentMessageHasCliUuid,
         } as any);
       }
 
@@ -726,8 +732,8 @@ export async function consumeStream(
     toolActivity.finalise('error');
 
     // Session-not-found mid-stream: clear stale session and mark broken.
-    finalizeSessionError(services, threadId, writer, message, writer.text);
-    services.chat.updateMessageState(currentMessageId as any, { forkable: true } as any);
+    finalizeSessionError(services, threadId, writer, message, writer.text, { isRevert: !!ctx.revertCliUuid });
+    services.chat.updateMessageState(currentMessageId as any, { forkable: currentMessageHasCliUuid } as any);
 
     // Kill the CLI subprocess on error (it may be in a bad state).
     try { handle.kill(); } catch { /* already gone */ }
@@ -760,11 +766,23 @@ export function finalizeSessionError(
   writer: ReturnType<typeof createStreamWriter>,
   errorText: string,
   prefix?: string,
+  context?: { isRevert?: boolean },
 ): void {
   const staleId = extractStaleSessionId(errorText);
-  const warning = staleId
-    ? '⚠️ Session expired — the conversation file was deleted or is invalid. Your next message will start a fresh session in the same project directory. Previous messages are still visible for reference.'
-    : `⚠️ ${errorText}`;
+  // Distinguish "message UUID not found" (e.g. reverting past a compaction
+  // point) from "session file deleted" — the user-facing message should be
+  // specific so they understand what happened.
+  const isUuidNotFound = /No message found with message\.uuid/i.test(errorText);
+  let warning: string;
+  if (staleId && context?.isRevert && isUuidNotFound) {
+    warning = '⚠️ Could not revert — the revert point no longer exists in the current session (likely due to compaction). Your conversation history is preserved. Your next message will start a fresh session.';
+  } else if (staleId && context?.isRevert) {
+    warning = '⚠️ Could not revert — the session file was deleted or moved. Your conversation history is preserved but the CLI session cannot be resumed. Your next message will start a fresh session.';
+  } else if (staleId) {
+    warning = '⚠️ Session expired — the conversation file was deleted or is invalid. Your next message will start a fresh session in the same project directory. Previous messages are still visible for reference.';
+  } else {
+    warning = `⚠️ ${errorText}`;
+  }
   writer.finalize(prefix ? `${prefix}\n\n${warning}`.trim() : warning);
   markSessionBroken(services, threadId, staleId ? `Session ${staleId} not found` : errorText);
 }
@@ -775,7 +793,7 @@ export function finalizeSessionError(
  * The caller dequeues the message *before* calling `setRunning(false)` so
  * there is no race window where a new incoming message could interleave.
  */
-async function replayQueuedMessage(
+export async function replayQueuedMessage(
   services: Services,
   threadId: EntityId,
   queued: { text: string; mode?: string; phase?: string; messageId?: string; references?: any },

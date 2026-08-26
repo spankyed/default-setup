@@ -7,7 +7,8 @@
  */
 
 import type { ActionMeta, Services, Z } from '../../types';
-import { getClaudeState } from './_helpers/thread-context';
+import { getClaudeState, persistClaudeState, updateChatState } from './_helpers/thread-context';
+import { DONT_BYPASS } from './_helpers/auto-approve';
 
 export const meta: ActionMeta = {
   label: 'CC: Run Command',
@@ -59,6 +60,7 @@ const handlers: Record<string, Handler> = {
   skills: handleSkills,
   stats: handleStats,
   rename: handleRename,
+  bypass: handleBypass,
   // Passthrough commands — exec and relay stdout
   ...Object.fromEntries(
     Object.entries(PASSTHROUGH).map(([name, spec]) => [name, makePassthroughHandler(spec)]),
@@ -117,7 +119,7 @@ async function handleSessions(
   const effectiveCwd = prior?.cwdOverride
     || prior?.cwd
     || codeSettings?.defaultBaseDirectory
-    || codeSettings?.lastDirectoryOpened
+    || codeSettings?.baseDirectory
     || undefined;
   const cwdOpts = effectiveCwd ? { cwd: effectiveCwd } : undefined;
 
@@ -287,7 +289,8 @@ async function generateTitle(services: Services, threadId: string): Promise<stri
   if (messages.length === 0) return 'Untitled';
 
   const serialized = messages
-    .filter((m: any) => !m.compacted && m.status !== 'cancelled' && !m.deleted && m.text)
+    .filter((m: any) => !m.compacted && m.status !== 'cancelled' && !m.deleted && m.text
+      && !(m.sender === 'user' && /^\/\S+/.test(m.text)))
     .slice(-10)
     .map((m: any) => {
       const role = m.sender === 'user' ? 'User' : 'Assistant';
@@ -298,7 +301,7 @@ async function generateTitle(services: Services, threadId: string): Promise<stri
   if (!serialized) return 'Untitled';
 
   const handle = await services.cli.claudeCode.query({
-    prompt: `Generate a short, descriptive title (3-6 words, no quotes) for this conversation:\n\n${serialized}`,
+    prompt: `Generate a short, descriptive title (3-6 words, no quotes) for this conversation. Respond with ONLY the title text, nothing else.\n\n${serialized}`,
     permissionMode: 'plan',
     allowedTools: [],
     noSessionPersistence: true,
@@ -307,5 +310,53 @@ async function generateTitle(services: Services, threadId: string): Promise<stri
 
   for await (const _ev of handle.events) { /* drain */ }
   const result = await handle.result;
-  return result.text?.trim().replace(/^["']|["']$/g, '') || 'Untitled';
+  const title = result.text?.trim().replace(/^["']|["']$/g, '') || '';
+
+  // Reject obviously bad titles (too long or LLM went off-script)
+  if (!title || title.length > 60 || title.includes('\n')) return 'Untitled';
+  return title;
+}
+
+async function handleBypass(
+  _args: string[],
+  services: Services,
+  threadId?: string,
+): Promise<{ text: string; data?: any }> {
+  if (!threadId) return { text: 'No active thread — run a Claude Code turn first.' };
+
+  const prior = getClaudeState(services, threadId);
+  if (!prior) return { text: 'No Claude Code state on this thread.' };
+
+  const current = prior.permissionMode ?? 'default';
+  const enabling = current !== 'bypassPermissions';
+  const mode = enabling ? 'bypassPermissions' : 'default';
+  const updates: Record<string, unknown> = { permissionMode: mode };
+
+  // Auto-approve pending control request when enabling bypass
+  if (enabling) {
+    const pending = prior.pendingControlRequest;
+    if (pending?.requestId && !DONT_BYPASS.has(pending.toolName)) {
+      const handle = (services.cli as any).claudeCode.getHandle(threadId);
+      if (handle) {
+        handle.respond(pending.requestId, {
+          behavior: 'allow',
+          updatedInput: pending.originalInput ?? {},
+        });
+        services.chat.updateMessageState(pending.approvalMessageId as any, {
+          responseTimestamp: Date.now(),
+          blockResponse: { approved: true },
+        } as any);
+        updates.pendingControlRequest = undefined;
+        updates.isRunning = true;
+      }
+    }
+  }
+
+  persistClaudeState(services, threadId, updates as any);
+
+  if (updates.isRunning) {
+    updateChatState(services, threadId as any, 'working');
+  }
+
+  return { text: enabling ? 'Bypass enabled' : 'Bypass disabled' };
 }

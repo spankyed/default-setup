@@ -1,10 +1,9 @@
-import type { ActionMeta, EntityId, Services, Z } from '../../../types';
-import { getOnboardingState, persistOnboardingState, flashState, type OnboardingState } from '../onboarding-helpers';
-import { startCcImportStep } from './handle-projects-step';
+import type { ActionMeta, EntityId, Services } from '../../../types';
+import { getOnboardingState, persistOnboardingState, flashState } from '../onboarding-helpers';
 
 export const meta: ActionMeta = {
   label: 'Handle Welcome Step',
-  description: 'Tests CLI availability and advances to cc-import or asks about CLI setup',
+  description: 'Detects CLIs, discovers sessions, and presents project directory selection',
   category: 'onboarding',
   input: {
     threadId: { type: 'string', required: true },
@@ -21,80 +20,103 @@ export async function action(
   if (!state) return { success: false, reason: 'no-state' };
 
   flashState(services, threadId);
-  await testCliAndAdvance(services, state, threadId);
-  persistOnboardingState(services, threadId, state);
 
-  return { success: true, step: state.step };
-}
+  // ── Detect both CLIs in parallel ──────────────────────────────────
+  const [ccResult, codexResult] = await Promise.all([
+    services.cli.testCli('claude-code'),
+    services.cli.testCli('codex'),
+  ]);
 
-export async function testCliAndAdvance(
-  services: Services,
-  state: OnboardingState,
-  threadId: EntityId,
-) {
-  const cliResult = await services.cli.testCli('claude-code');
-  const cliFound = cliResult.success;
+  const ccFound = ccResult.success;
+  const codexFound = codexResult.success;
 
-  let authenticated = false;
-  let authErrorMsg = '';
-  if (cliFound) {
+  let ccAuthenticated = false;
+  if (ccFound) {
     try {
       const auth = await services.cli.claudeCode.authStatus();
-      authenticated = auth.authenticated === true || auth.loggedIn === true;
-      if (!authenticated) {
-        authErrorMsg = 'Claude Code reports it is not authenticated.';
-      }
-    } catch (err: any) {
-      authErrorMsg = err?.message || 'Auth status check failed.';
-    }
+      ccAuthenticated = (auth as any).authenticated === true || (auth as any).loggedIn === true;
+    } catch { /* auth check failed */ }
   }
 
-  state.data.cliFound = cliFound;
-  state.data.authenticated = authenticated;
+  state.data.cliFound = ccFound;
+  state.data.authenticated = ccAuthenticated;
+  state.data.codexFound = codexFound;
 
-  if (cliFound && authenticated) {
-    services.chat.sendBlockMessage({
-      threadId,
-      text: 'Claude Code CLI detected and working!',
-      blocks: [],
-      forkable: false,
+  // ── Status message ────────────────────────────────────────────────
+  const lines: string[] = [];
+  if (ccFound && ccAuthenticated) lines.push('**Claude Code** — ready to go');
+  else if (ccFound) lines.push('**Claude Code** — installed but needs authentication. Run `claude` in your terminal to sign in.');
+  else lines.push('**Claude Code** — not installed. You can add it later with `npm i -g @anthropic-ai/claude-code`');
+
+  if (codexFound) lines.push('**Codex** — ready to go');
+  else lines.push('**Codex** — not installed. You can add it later with `npm i -g @openai/codex`');
+
+  services.chat.sendBlockMessage({ threadId, text: lines.join('\n'), blocks: [], forkable: false });
+
+  // ── Discover sessions from both providers → extract project dirs ──
+  const [ccSessions, codexSessions] = await Promise.all([
+    (ccFound && ccAuthenticated)
+      ? services.cli.claudeCode.listAllSessions({ limit: 50 }).catch(() => [] as any[])
+      : Promise.resolve([] as any[]),
+    codexFound
+      ? (services.codex as any).listAllSessions({ limit: 50 }).catch(() => [] as any[])
+      : Promise.resolve([] as any[]),
+  ]);
+
+  state.data.ccSessionCount = ccSessions.length;
+  state.data.codexSessionCount = codexSessions.length;
+
+  // Extract unique project directories from all sessions
+  const cwdSet = new Set<string>();
+  for (const s of [...ccSessions, ...codexSessions]) {
+    if (s.cwd) cwdSet.add(s.cwd);
+  }
+  const projectDirs = Array.from(cwdSet);
+
+  if (projectDirs.length > 0) {
+    // Show multi-select of discovered directories
+    const choices = projectDirs.map((dir: string) => {
+      const name = dir.split('/').filter(Boolean).pop() || dir;
+      return { id: dir, label: name, description: dir };
     });
 
-    startCcImportStep(services, state, threadId);
-  } else if (cliFound && !authenticated) {
-    const detail = authErrorMsg ? ` (${authErrorMsg})` : '';
     const { messageId } = services.chat.sendChoiceBlock({
       threadId,
-      text: `Claude Code CLI found, but authentication failed${detail}. Please run \`claude\` in your terminal to sign in, then come back and re-test.`,
-      prompt: 'What would you like to do?',
-      choices: [
-        { id: 'retest', label: 'Re-test CLI', description: 'Try detecting Claude Code again' },
-        { id: 'skip', label: 'Skip for now', description: "I'll set this up later" },
-      ],
+      text: `I found ${projectDirs.length} project director${projectDirs.length === 1 ? 'y' : 'ies'} from your ${[ccSessions.length > 0 && 'Claude Code', codexSessions.length > 0 && 'Codex'].filter(Boolean).join(' and ')} sessions. Select the ones you'd like to add.`,
+      prompt: 'Select projects to add',
+      choices,
+      multiSelect: true,
+      skipOption: { id: 'skip', label: 'Skip' },
       allowCustom: false,
+      compact: true,
       forkable: false,
       autoHide: true,
       asUser: true,
     });
 
-    state.step = 'cli-test-ask';
+    state.step = 'projects';
     state.pendingMessageId = messageId;
   } else {
-    const { messageId } = services.chat.sendChoiceBlock({
+    // No sessions found — show file-picker as fallback
+    const projects = (services.repository.settingsQueries.getGeneralSettings('projects') as any[]) || [];
+    const { messageId } = services.chat.sendBlockMessage({
       threadId,
-      text: "I wasn't able to detect the Claude Code CLI. Do you already have Claude Code CLI installed with an active subscription?",
-      prompt: 'Claude Code CLI status',
-      choices: [
-        { id: 'yes', label: 'Yes, I have it', description: 'I have Claude Code installed and subscribed' },
-        { id: 'no', label: "No, I don't", description: "I haven't set up Claude Code yet" },
+      text: 'No existing sessions found. Pick a project directory to get started, or skip to set one up later.',
+      blocks: [
+        { type: 'prompt', props: { content: 'Select a project directory' } },
+        ...(projects.length > 0 ? [{ type: 'project-select', props: { projects } }] : []),
+        { type: 'file-picker', props: { fileType: 'directory' } },
       ],
-      allowCustom: false,
       forkable: false,
       autoHide: true,
       asUser: true,
-    });
+      asideContext: 'Project',
+    } as any);
 
-    state.step = 'cli-test-ask';
+    state.step = 'projects';
     state.pendingMessageId = messageId;
   }
+
+  persistOnboardingState(services, threadId, state);
+  return { success: true, step: state.step };
 }

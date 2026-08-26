@@ -1,9 +1,9 @@
 import type { ActionMeta, EntityId, Services } from '../../../types';
-import { getOnboardingState, persistOnboardingState, finishOnboarding, flashState, type OnboardingState } from '../onboarding-helpers';
+import { getOnboardingState, persistOnboardingState, showChooseModeOrFinish, flashState } from '../onboarding-helpers';
 
 export const meta: ActionMeta = {
   label: 'Handle Projects Step',
-  description: 'Handles project directory selection response and asks about thread import',
+  description: 'Saves selected project directories and offers per-provider import',
   category: 'onboarding',
   input: {
     threadId: { type: 'string', required: true },
@@ -21,10 +21,13 @@ export async function action(
   if (!state) return { success: false, reason: 'no-state' };
 
   flashState(services, threadId);
-  const selected = Array.isArray(response) ? response : typeof response === 'string' ? [response] : [];
 
-  if (selected.length > 0 && selected[0] !== '') {
-    const projectEntries = selected.map((dir: string) => ({
+  // ── Save selected directories ─────────────────────────────────────
+  const selected = Array.isArray(response) ? response : typeof response === 'string' ? [response] : [];
+  const dirs = selected.filter((d: string) => d && d !== 'skip' && d !== '');
+
+  if (dirs.length > 0) {
+    const projectEntries = dirs.map((dir: string) => ({
       name: dir.split('/').filter(Boolean).pop() || 'Project',
       directories: [dir],
       color: '#3B82F6',
@@ -32,7 +35,9 @@ export async function action(
 
     services.repository.settingsCommands.updateSettings('general', 'projects', [], projectEntries);
 
-    // Broadcast to frontend so the settings plugin picks up the new projects immediately
+    // Set first directory as default CWD
+    services.settings.updatePluginSetting('code', ['defaultBaseDirectory'], dirs[0]);
+
     services.emitter.sendToPlugin('settings', {
       type: 'SETTINGS_UPDATED',
       data: services.repository.settingsQueries.getSettings(),
@@ -40,92 +45,42 @@ export async function action(
 
     services.chat.sendBlockMessage({
       threadId,
-      text: `Added ${projectEntries.length} project${projectEntries.length === 1 ? '' : 's'} to your settings.`,
+      text: `Added ${projectEntries.length} project${projectEntries.length === 1 ? '' : 's'}.`,
       blocks: [],
       forkable: false,
     });
   }
 
-  // Ask if user wants to import threads
-  const { messageId } = services.chat.sendChoiceBlock({
-    threadId,
-    text: 'Would you like to import your existing Claude Code threads? This may take a minute.',
-    prompt: 'Import threads',
-    choices: [
-      { id: 'yes', label: 'Yes, import threads', description: 'Import recent sessions as threads' },
-      { id: 'no', label: 'No, skip', description: "I'll start fresh" },
-    ],
-    allowCustom: false,
-    forkable: false,
-    autoHide: true,
-    asUser: true,
-  });
+  // ── Show per-provider import prompt ───────────────────────────────
+  const ccCount = state.data.ccSessionCount || 0;
+  const codexCount = state.data.codexSessionCount || 0;
 
-  state.step = 'import-threads';
-  state.pendingMessageId = messageId;
-  persistOnboardingState(services, threadId, state);
-  return { success: true, step: state.step };
-}
-
-/**
- * Start the cc-import step — discovers sessions and asks about project creation.
- * Called by the welcome step after CLI is confirmed working.
- * This is a helper, not an action (no meta export).
- */
-export async function startCcImportStep(
-  services: Services,
-  state: OnboardingState,
-  threadId: EntityId,
-) {
-  let sessions: any[] = [];
-
-  try {
-    sessions = await services.cli.claudeCode.listAllSessions({ limit: 50 });
-  } catch {
-    // If listing fails, skip to finish
-  }
-
-  if (!sessions.length) {
-    services.chat.sendBlockMessage({
-      threadId,
-      text: 'No existing Claude Code sessions found. No worries — you can import sessions later with `/cc-import`.',
-      blocks: [],
-      forkable: false,
-    });
-    finishOnboarding(services, state, threadId);
-    persistOnboardingState(services, threadId, state);
-    return;
-  }
-
-  // Extract unique project directories from sessions
-  const cwdSet = new Set<string>();
-  for (const s of sessions) {
-    if (s.cwd) cwdSet.add(s.cwd);
-  }
-  const projectDirs = Array.from(cwdSet);
-
-  if (projectDirs.length > 0) {
-    const choices = projectDirs.map((dir: string) => {
-      const name = dir.split('/').filter(Boolean).pop() || dir;
-      return { id: dir, label: name, description: dir };
-    });
+  if (ccCount > 0 || codexCount > 0) {
+    const choices: any[] = [];
+    if (ccCount > 0) choices.push({ id: 'cc', label: `Claude Code threads (${ccCount} sessions)` });
+    if (codexCount > 0) choices.push({ id: 'codex', label: `Codex threads (${codexCount} sessions)` });
 
     const { messageId } = services.chat.sendChoiceBlock({
       threadId,
-      text: `I found ${projectDirs.length} project director${projectDirs.length === 1 ? 'y' : 'ies'} from your Claude Code sessions. Would you like to add them as projects?`,
-      prompt: 'Select projects to add',
+      text: 'Which sessions would you like to import as threads?',
+      prompt: 'Import threads',
       choices,
       multiSelect: true,
+      skipOption: { id: 'skip', label: 'Skip' },
       allowCustom: false,
-      compact: true,
       forkable: false,
       autoHide: true,
       asUser: true,
     });
 
-    state.step = 'projects';
+    state.step = 'import-threads';
     state.pendingMessageId = messageId;
-  } else {
-    finishOnboarding(services, state, threadId);
+    persistOnboardingState(services, threadId, state);
+    return { success: true, step: state.step };
   }
+
+  // ── No sessions — skip to mode chooser or finish ──────────────────
+  showChooseModeOrFinish(services, state, threadId);
+  persistOnboardingState(services, threadId, state);
+  return { success: true, step: state.step };
 }

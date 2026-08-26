@@ -195,6 +195,120 @@ function extractInlinedHelpers(jsSource: string, functionName: string): string {
   return helpers.join('\n');
 }
 
+// --- Services parameter stripping ---
+
+/**
+ * Compute the source range to delete when removing one item from a
+ * comma-separated list (parameters or arguments), including its comma.
+ */
+function computeRemovalRange(
+  items: ts.NodeArray<ts.Node>,
+  index: number,
+): { start: number; end: number } | null {
+  if (index < 0 || index >= items.length) return null;
+  const target = items[index];
+  if (items.length === 1) return { start: target.getStart(), end: target.getEnd() };
+  // Not last → consume trailing comma; last → consume leading comma
+  return index < items.length - 1
+    ? { start: target.getStart(), end: items[index + 1].getStart() }
+    : { start: items[index - 1].getEnd(), end: target.getEnd() };
+}
+
+/** Get the name and `services` param index for a function-like node, if any. */
+function getFunctionServicesInfo(
+  stmt: ts.Statement,
+): { name: string; params: ts.NodeArray<ts.ParameterDeclaration>; idx: number } | null {
+  // function foo(services, ...) {}
+  if (ts.isFunctionDeclaration(stmt) && stmt.name) {
+    const idx = stmt.parameters.findIndex(p => ts.isIdentifier(p.name) && p.name.text === 'services');
+    if (idx >= 0) return { name: stmt.name.text, params: stmt.parameters, idx };
+  }
+  // var foo = (services, ...) => {} | var foo = function(services, ...) {}
+  if (ts.isVariableStatement(stmt)) {
+    for (const decl of stmt.declarationList.declarations) {
+      if (!ts.isIdentifier(decl.name) || !decl.initializer) continue;
+      const init = decl.initializer;
+      if (ts.isArrowFunction(init) || ts.isFunctionExpression(init)) {
+        const idx = init.parameters.findIndex(p => ts.isIdentifier(p.name) && p.name.text === 'services');
+        if (idx >= 0) return { name: decl.name.text, params: init.parameters, idx };
+      }
+    }
+  }
+  return null;
+}
+
+/** True if `name` only appears as a direct call or its own declaration (no value references). */
+function isOnlyCalledDirectly(name: string, sourceFile: ts.SourceFile): boolean {
+  let safe = true;
+  function visit(node: ts.Node) {
+    if (!safe) return;
+    if (ts.isIdentifier(node) && node.text === name) {
+      const p = node.parent;
+      if (ts.isFunctionDeclaration(p) && p.name === node) return;          // own decl
+      if (ts.isCallExpression(p) && p.expression === node) return;         // direct call
+      if (ts.isPropertyAccessExpression(p) && p.name === node) return;     // obj.name
+      safe = false;
+    }
+    ts.forEachChild(node, visit);
+  }
+  ts.forEachChild(sourceFile, visit);
+  return safe;
+}
+
+/**
+ * Strip redundant `services` parameters from inlined helper functions and
+ * their call sites.  After inlining, `services` is already in the outer
+ * scope (from `new AsyncFunction('params', 'services', body)`), so the
+ * parameter just shadows the typed global and breaks Monaco intellisense.
+ *
+ * Functions referenced as values (e.g. dispatch tables) are left alone
+ * because we can't update their indirect call sites.
+ */
+function stripServicesParam(code: string): string {
+  const sourceFile = ts.createSourceFile('action.js', code, ts.ScriptTarget.ES2022, true, ts.ScriptKind.JS);
+
+  // Build map: functionName → services param index (only for directly-called helpers)
+  const servicesMap = new Map<string, number>();
+  for (const stmt of sourceFile.statements) {
+    const info = getFunctionServicesInfo(stmt);
+    if (info && isOnlyCalledDirectly(info.name, sourceFile)) {
+      servicesMap.set(info.name, info.idx);
+    }
+  }
+  if (servicesMap.size === 0) return code;
+
+  // Collect edit ranges: parameter removals + call-site argument removals
+  const edits: { start: number; end: number }[] = [];
+
+  for (const stmt of sourceFile.statements) {
+    const info = getFunctionServicesInfo(stmt);
+    if (info && servicesMap.has(info.name)) {
+      const range = computeRemovalRange(info.params, info.idx);
+      if (range) edits.push(range);
+    }
+  }
+
+  function collectCallEdits(node: ts.Node) {
+    if (ts.isCallExpression(node) && ts.isIdentifier(node.expression)) {
+      const idx = servicesMap.get(node.expression.text);
+      if (idx !== undefined && node.arguments.length > idx) {
+        const range = computeRemovalRange(node.arguments, idx);
+        if (range) edits.push(range);
+      }
+    }
+    ts.forEachChild(node, collectCallEdits);
+  }
+  ts.forEachChild(sourceFile, collectCallEdits);
+
+  // Apply edits in reverse order to preserve positions
+  edits.sort((a, b) => b.start - a.start);
+  let result = code;
+  for (const { start, end } of edits) {
+    result = result.substring(0, start) + result.substring(end);
+  }
+  return result;
+}
+
 // --- File scanning ---
 
 function scanSourceFiles(dir: string): { sourceFiles: string[]; helperFiles: string[] } {
@@ -259,10 +373,13 @@ async function compileSourceFile(
   // Extract inlined helper declarations
   const inlinedHelpers = extractInlinedHelpers(bundledJs, config.functionName);
 
-  // Assemble function body = helpers + body
-  const fnBody = inlinedHelpers
+  // Assemble function body = helpers + body, then strip redundant `services`
+  // params from inlined helpers (services is already in scope from the outer
+  // AsyncFunction wrapper, and keeping the param shadows the typed global).
+  const rawFnBody = inlinedHelpers
     ? `${inlinedHelpers}\n\n${body}`
     : body;
+  const fnBody = stripServicesParam(rawFnBody);
 
   const compiled: Record<string, any> = {
     label: meta.label,

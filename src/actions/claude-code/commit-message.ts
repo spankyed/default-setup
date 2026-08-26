@@ -6,6 +6,7 @@
  */
 
 import type { ActionMeta, Services, Z } from '../../types';
+import { formatProviderError } from '../_helpers/format-provider-error';
 
 export const meta: ActionMeta = {
   label: 'CC: Commit Message',
@@ -99,7 +100,7 @@ export async function action(
 
     return { success: true };
   } catch (error: any) {
-    const errorMessage = error?.message || 'Unknown error';
+    const errorMessage = formatProviderError(error, 'Claude Code');
     services.emitter.sendToPlugin('code', {
       type: 'commit.ERROR_RECEIVED',
       data: { message: errorMessage },

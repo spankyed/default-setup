@@ -9,7 +9,8 @@
  */
 
 import type { ActionMeta, Services, EntityId } from '../../types';
-import { getClaudeState, persistClaudeState } from './_helpers/thread-context';
+import { getClaudeState, persistClaudeState, dequeueMessage } from './_helpers/thread-context';
+import { replayQueuedMessage } from './_helpers/stream-consumer';
 
 export const meta: ActionMeta = {
   label: 'CC: Handle Fork',
@@ -33,12 +34,20 @@ export async function action(
   };
 
   if (!sourceThreadId || !newThreadId) {
+    if (newThreadId) {
+      persistClaudeState(services, newThreadId, { forkPending: undefined });
+      const queued = dequeueMessage(services, newThreadId);
+      if (queued) await replayQueuedMessage(services, newThreadId as EntityId, queued, services.logger);
+    }
     return { success: false, reason: 'missing sourceThreadId or newThreadId' };
   }
 
   const log = services.logger;
   const sourceState = getClaudeState(services, sourceThreadId);
   if (!sourceState?.sessionId) {
+    persistClaudeState(services, newThreadId, { forkPending: undefined });
+    const queued = dequeueMessage(services, newThreadId);
+    if (queued) await replayQueuedMessage(services, newThreadId as EntityId, queued, log);
     return { success: true, copied: false };
   }
 
@@ -67,11 +76,41 @@ export async function action(
     }
   }
 
+  // Validate cliUuid exists in current session JSONL (post-compaction guard).
+  // After compaction the sessionId changes but existing messages retain
+  // cliUuids from the old session. Passing a stale UUID to
+  // --resume-session-at would trigger "No message found" / "Session not found".
+  // Same pattern as handle-revert.ts:79-107.
+  if (cliUuid && sourceState.sessionId) {
+    let uuidValid = false;
+    try {
+      const transcript = await services.cli.claudeCode.viewSession(
+        sourceState.sessionId,
+        { cwd: sourceState.cwd },
+      ) as Array<Record<string, unknown>>;
+      uuidValid = transcript.some(
+        (e: any) => e.type === 'assistant' && e.uuid === cliUuid,
+      );
+    } catch (err: any) {
+      log.warn('[fork] could not validate cliUuid against session JSONL', {
+        sourceThreadId, sessionId: sourceState.sessionId, cliUuid, err: err?.message,
+      });
+    }
+    if (!uuidValid) {
+      log.info('[fork] cliUuid not found in current session (likely post-compaction) — forking from end', {
+        sourceThreadId, cliUuid, sessionId: sourceState.sessionId,
+      });
+      cliUuid = undefined;
+    }
+  }
+
   persistClaudeState(services, newThreadId, {
     sessionId: sourceState.sessionId,
+    sessionWorktree: sourceState.sessionWorktree,
     lastTurnAt: sourceState.lastTurnAt,
     cwd: sourceState.cwd,
     forkFrom: { sessionId: sourceState.sessionId, cliUuid },
+    forkPending: undefined,
   });
 
   log.debug('copied session state to forked thread', {
@@ -80,6 +119,9 @@ export async function action(
     sessionId: sourceState.sessionId,
     cliUuid: cliUuid ?? 'none (will fork from end)',
   });
+
+  const queued = dequeueMessage(services, newThreadId);
+  if (queued) await replayQueuedMessage(services, newThreadId as EntityId, queued, log);
 
   return { success: true, copied: true, sessionId: sourceState.sessionId, cliUuid };
 }

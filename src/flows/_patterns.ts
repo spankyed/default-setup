@@ -72,3 +72,18 @@ export function fire(event: string, opts?: { label?: string; scope?: 'local' | '
 export function subflow(flow: string, opts?: { label?: string; map?: Record<string, string> }): DSLStepNode {
   return { type: 'flow', flow, ...opts };
 }
+
+/**
+ * A node that immediately terminates the containing flow.
+ * Counterpart to `keepAlive()` — use at the end of a branch when the flow's
+ * job is done (e.g. after onboarding completes).
+ */
+export function killFlow(label: string = 'Kill Flow'): DSLStepNode {
+  // Cast needed until defs/ is regenerated with DSLKillNode via `npm run build:be`
+  return { type: 'kill', label } as unknown as DSLStepNode;
+}
+
+/** Schedule track: fires downstream steps on a cron schedule */
+export function schedule(cron: string, exits: DSLStepNode[][], label?: string): Track {
+  return { schedule: cron, label: label ?? `Schedule (${cron})`, exits };
+}

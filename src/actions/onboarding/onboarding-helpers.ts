@@ -1,10 +1,10 @@
 import type { EntityId, Services } from '../../types';
 
 export interface OnboardingState {
-  step: 'welcome' | 'cli-test-ask' | 'projects' | 'import-threads' | 'pick-thread' | 'hermes-setup' | 'complete';
+  step: 'welcome' | 'projects' | 'import-threads' | 'pick-thread' | 'choose-mode' | 'complete';
   threadId: EntityId;
   pendingMessageId: EntityId;
-  data: { cliFound?: boolean; authenticated?: boolean };
+  data: { cliFound?: boolean; authenticated?: boolean; codexFound?: boolean; ccSessionCount?: number; codexSessionCount?: number; chosenMode?: string };
 }
 
 export function getOnboardingState(services: Services, threadId: EntityId): OnboardingState | null {
@@ -32,37 +32,55 @@ export function flashState(services: Services, threadId: EntityId, stateId: stri
   });
 }
 
+/** Recent imported threads from both providers, sorted by recency. */
+export function getRecentImportedThreads(services: Services, excludeThreadId: EntityId, limit = 7): any[] {
+  return services.repository.threadQueries.all()
+    .filter((t: any) => (t.tags?.includes('claude-code') || t.tags?.includes('codex')) && t.id !== excludeThreadId)
+    .sort((a: any, b: any) => (b.lastMessageTimestamp || b.timestamp) - (a.lastMessageTimestamp || a.timestamp))
+    .slice(0, limit);
+}
+
 /**
- * Finish onboarding. On first call, shows the Hermes setup prompt.
- * On second call (from hermes-setup handler), actually completes.
+ * Gate before finishing: if both CLIs are available, ask the user to
+ * choose their default mode. Otherwise finish directly.
+ * Every code path that ends onboarding should call this instead of
+ * finishOnboarding() directly.
  */
+export function showChooseModeOrFinish(
+  services: Services,
+  state: OnboardingState,
+  threadId: EntityId,
+  options?: { skipCompletionMessage?: boolean },
+): void {
+  if (state.data.cliFound && state.data.codexFound) {
+    const { messageId } = services.chat.sendChoiceBlock({
+      threadId,
+      text: 'Which agent would you like to use by default?',
+      prompt: 'Default agent',
+      choices: [
+        { id: 'Claude Code', label: 'Claude Code', description: 'Anthropic Claude' },
+        { id: 'Codex', label: 'Codex', description: 'OpenAI Codex' },
+      ],
+      allowCustom: false,
+      forkable: false,
+      autoHide: true,
+      asUser: true,
+    });
+    state.step = 'choose-mode';
+    state.pendingMessageId = messageId as EntityId;
+    return;
+  }
+
+  // Only one CLI — skip the choice and finish
+  finishOnboarding(services, state, threadId, options);
+}
+
 export function finishOnboarding(
   services: Services,
   state: OnboardingState,
   threadId: EntityId,
   options?: { skipCompletionMessage?: boolean },
 ) {
-  // If not yet past hermes-setup, show the prompt first
-  if (state.step !== 'hermes-setup') {
-    const { messageId } = services.chat.sendChoiceBlock({
-      threadId,
-      text: 'Would you like to set up Hermes Agent? Hermes is an autonomous AI agent framework that supports 200+ models from OpenAI, Anthropic, and more.',
-      prompt: 'Set up Hermes?',
-      choices: [
-        { id: 'yes', label: 'Yes, set up Hermes', description: '' },
-        { id: 'skip', label: 'Skip for now', description: '' },
-      ],
-      allowCustom: false,
-      forkable: false,
-      autoHide: true,
-      asUser: true,
-    } as any);
-    state.step = 'hermes-setup';
-    state.pendingMessageId = messageId as EntityId;
-    return;
-  }
-
-  // Actually complete
   state.step = 'complete';
 
   services.settings.updateInternalSetting(['hasOnboarded'], true);
@@ -74,22 +92,14 @@ export function finishOnboarding(
   });
 
   if (!options?.skipCompletionMessage) {
-    const allThreads = services.repository.threadQueries.all();
-    const ccThreads = allThreads
-      .filter((t: any) => t.tags?.includes('claude-code') && t.id !== threadId)
-      .sort((a: any, b: any) => {
-        const aTime = a.lastMessageTimestamp || a.timestamp;
-        const bTime = b.lastMessageTimestamp || b.timestamp;
-        return bTime - aTime;
-      })
-      .slice(0, 7);
+    const recentThreads = getRecentImportedThreads(services, threadId);
 
-    if (ccThreads.length > 0) {
+    if (recentThreads.length > 0) {
       services.chat.sendChoiceBlock({
         threadId,
         text: "You're all setup! Here are some of your previous threads. Or click `+ New thread` below the chat to get to work on something new!",
         prompt: 'Continue a previous thread',
-        choices: ccThreads.map((t: any) => ({ id: t.id, label: t.topic || 'Untitled', description: t.tags?.join(', ') || '' })),
+        choices: recentThreads.map((t: any) => ({ id: t.id, label: t.topic || 'Untitled', description: t.tags?.join(', ') || '' })),
         allowCustom: false,
         forkable: false,
       });
@@ -111,10 +121,22 @@ export function finishOnboarding(
 
   services.emitter.sendToSystem('threads', { type: 'REFRESH_THREADS' });
 
+  // Use the mode the user chose, or auto-detect from available CLIs
+  const defaultMode = state.data.chosenMode
+    || ((!state.data.cliFound && state.data.codexFound) ? 'Codex' : 'Claude Code');
+  services.settings.updatePluginSetting('threads', ['chat', 'defaultMode'], defaultMode);
+  // Push the updated chat settings to the frontend so resolveDefaultModePhase picks up the new default
+  const chatSettings = services.repository.settingsQueries.getPluginSettings('threads')?.chat;
+  if (chatSettings) {
+    services.emitter.sendToPlugin('threads', {
+      type: 'AGENT_SETTINGS_UPDATED',
+      settings: chatSettings,
+    } as any);
+  }
   services.emitter.sendToPlugin('threads', {
     type: 'SET_MODE',
-    mode: 'claude-code',
+    mode: defaultMode,
   });
 
-  (services.emitter as any).sendToPlugin('application', { type: 'RESTORE_CHAT' });
+  (services.emitter as any).sendToPlugin('application', { type: 'ONBOARDING_COMPLETE' });
 }

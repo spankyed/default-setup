@@ -33,7 +33,8 @@ const settings: SettingsData = {
           key: 'b',
           modifiers: ['cmd']
         }
-      }
+      },
+      openLinksInApp: true
     },
     projects: []
   },
@@ -42,13 +43,15 @@ const settings: SettingsData = {
       visibility: {
         threads: true,
         code: true,
-        library: true,
-        flows: true,
+        library: false,
+        flows: false,
         actions: false,
         prompts: false,
         brain: false,
         database: false,
         logs: false,
+        browser: false,
+        notes: false,
         settings: true,
         // blank: false,
       }
@@ -66,7 +69,7 @@ const settings: SettingsData = {
       },
       restoreTerminals: true,
       defaultBaseDirectory: null,
-      lastDirectoryOpened: null,
+      baseDirectory: null,
       enableShellIntegration: false,
       confirmTerminalClose: true,
       closeTerminalOnTabClose: true,
@@ -92,8 +95,8 @@ const settings: SettingsData = {
     },
     threads: {
       chat: {
-        defaultMode: 'claude-code',
-        defaultPhase: 'plan',
+        defaultMode: 'Claude Code',
+        defaultPhase: 'Plan',
         modes: [
           { id: 'birth', name: 'Birth', description: 'Assistant onboarding and setup mode', hidden: true },
           {
@@ -105,7 +108,15 @@ const settings: SettingsData = {
               { id: 'edit', name: 'Edit', description: 'Implementation and development', color: '#6B7280' },
             ]
           },
-          { id: 'hermes', name: 'Hermes', description: 'Hermes autonomous agent mode' },
+          {
+            id: 'codex',
+            name: 'Codex',
+            description: 'OpenAI Codex agent mode',
+            phases: [
+              { id: 'plan', name: 'Plan', description: 'Strategic planning and exploration', color: '#3B82F6' },
+              { id: 'default', name: 'Default', description: 'Implementation and development', color: '#6B7280' },
+            ]
+          },
           { id: 'manager', name: 'Manager', description: 'Delegate tasks and coordinate agents', hidden: true },
         ],
         hotkeys: {
@@ -188,8 +199,12 @@ const settings: SettingsData = {
       runningRootFlowId: undefined,
       inspectEnabled: false,
     },
+    browser: {
+      showBookmarksBar: true,
+    },
     notes: {
-      tasklistPanelPosition: 'left'
+      tasklistPanelPosition: 'left',
+      showCollapseIcon: true,
     },
     logs: {
       maxLogs: 1000,

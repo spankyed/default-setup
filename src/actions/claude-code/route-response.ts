@@ -37,7 +37,7 @@ export async function action(
 
   // Skip threads that aren't Claude Code threads (e.g. onboarding birth thread)
   const thread = services.repository.threadQueries.byId(threadId as any);
-  if (thread?.forcedMode === 'birth') {
+  if (thread?.forcedMode === 'Birth') {
     return { success: false, reason: 'birth thread — not a claude-code response' };
   }
 
@@ -58,11 +58,6 @@ export async function action(
 
   if (!pending || pending.approvalMessageId !== messageId) {
     return { success: false, reason: 'no matching pending control request' };
-  }
-
-  const handle = (services.cli as any).claudeCode.getHandle(threadId);
-  if (!handle) {
-    return { success: false, reason: 'no active CLI handle for thread' };
   }
 
   const denied = response?.approved === false || response?.cancelled === true;

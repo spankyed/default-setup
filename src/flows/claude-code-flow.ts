@@ -5,18 +5,19 @@ import { entry, on, keepAlive, action, branch } from './_patterns';
  * Claude Code mode flow.
  *
  * Listens for `user.message` events and routes to the Claude Code Chat
- * action only when the user is in `claude-code` mode. Any other mode (`chat`,
- * `note`, `birth`, …) flows past this track untouched — the switch node
+ * action only when the user is in `Claude Code` mode. Any other mode (`chat`,
+ * `note`, `Birth`, …) flows past this track untouched — the switch node
  * emits a `noMatch` completion and the chain ends without firing any
  * action. See `packages/api/src/systems/brain/node-handlers/switch-node.ts`
  * for the runtime semantics of "no condition matched, no else".
  *
- * The `phase` sub-value (`plan` / `edit` / `review`) is passed through so
+ * The `phase` sub-value (`Plan` / `Edit` / `review`) is passed through so
  * the chat action can prefix a phase-aware system prompt hint.
  */
 export default {
   "Claude Code": [
     entry(
+      [action("CC: Reconcile State", { label: "reconcile" })],
       [keepAlive()],
     ),
     on(
@@ -24,7 +25,7 @@ export default {
       [[
         branch([
           {
-            if: "$.event.data.payload.mode == 'claude-code'",
+            if: "$.event.data.payload.mode == 'Claude Code'",
             steps: [
               action("Claude Code Chat", {
                 label: "claude-code",
@@ -149,14 +150,14 @@ export default {
       "cc.stream.paused",
       [[
         action("CC: Stream Paused", {
-          label: "awaiting-permission",
+          label: "awaiting-input",
           map: {
             threadId: "$.event.data.payload.threadId",
             toolName: "$.event.data.payload.toolName",
           },
         }),
       ]],
-      "Permission requested",
+      "Awaiting user input",
     ),
     on(
       "cc.stream.completed",
@@ -234,6 +235,20 @@ export default {
       ]],
       "Worktree toggle updated",
     ),
+    on(
+      "user.goal.clear",
+      [[
+        action("CC: Goal", {
+          label: "goal-clear",
+          map: {
+            command: "cc-goal",
+            text: "clear",
+            threadId: "$.event.data.payload.threadId",
+          },
+        }),
+      ]],
+      "Goal cleared",
+    ),
     // ─── Thread lifecycle ────────────────────────────────────────────
     // Clean up Claude Code state when threads are reverted or forked.
     // Unified revert-family route — the `kind` discriminator routes to
@@ -242,54 +257,62 @@ export default {
     on(
       "thread.revert",
       [[
-        // Stop the active turn first so the stream consumer exits cleanly
-        // before any revert/rewind/summarize handler mutates session state.
-        // Sequential within this track — pause completes before the branch.
-        action("CC: Pause Turn", {
-          label: "pause-before-revert",
-          map: {
-            threadId: "$.event.data.payload.threadId",
-          },
-        }),
+        // Only handle reverts that affected Claude Code messages.
         branch([
           {
-            if: "$.event.data.payload.kind == 'revert'",
+            if: "$.event.data.payload.agents.claudeCode == true",
             steps: [
-              action("CC: Handle Revert", {
-                label: "revert",
+              // Stop the active turn first so the stream consumer exits cleanly
+              // before any revert/rewind/summarize handler mutates session state.
+              // Sequential within this track — pause completes before the branch.
+              action("CC: Pause Turn", {
+                label: "pause-before-revert",
                 map: {
                   threadId: "$.event.data.payload.threadId",
-                  messageId: "$.event.data.payload.messageId",
                 },
               }),
-            ],
-          },
-          {
-            if: "$.event.data.payload.kind == 'rewind'",
-            steps: [
-              action("CC: Handle Rewind", {
-                label: "rewind",
-                map: {
-                  threadId: "$.event.data.payload.threadId",
-                  messageId: "$.event.data.payload.messageId",
-                  userCliUuid: "$.event.data.payload.userCliUuid",
+              branch([
+                {
+                  if: "$.event.data.payload.kind == 'revert'",
+                  steps: [
+                    action("CC: Handle Revert", {
+                      label: "revert",
+                      map: {
+                        threadId: "$.event.data.payload.threadId",
+                        messageId: "$.event.data.payload.messageId",
+                      },
+                    }),
+                  ],
                 },
-              }),
-            ],
-          },
-          {
-            if: "$.event.data.payload.kind == 'summarize'",
-            steps: [
-              action("CC: Handle Summarize", {
-                label: "summarize",
-                map: {
-                  threadId: "$.event.data.payload.threadId",
-                  messageId: "$.event.data.payload.messageId",
+                {
+                  if: "$.event.data.payload.kind == 'rewind'",
+                  steps: [
+                    action("CC: Handle Rewind", {
+                      label: "rewind",
+                      map: {
+                        threadId: "$.event.data.payload.threadId",
+                        messageId: "$.event.data.payload.messageId",
+                        userCliUuid: "$.event.data.payload.userCliUuid",
+                      },
+                    }),
+                  ],
                 },
-              }),
+                {
+                  if: "$.event.data.payload.kind == 'summarize'",
+                  steps: [
+                    action("CC: Handle Summarize", {
+                      label: "summarize",
+                      map: {
+                        threadId: "$.event.data.payload.threadId",
+                        messageId: "$.event.data.payload.messageId",
+                      },
+                    }),
+                  ],
+                },
+              ], undefined, "Route Revert Kind"),
             ],
           },
-        ], undefined, "Route Revert Kind"),
+        ], undefined, "Gate CC Revert"),
       ]],
       "Thread reverted",
     ),
@@ -314,6 +337,7 @@ export default {
                 { if: "$.event.data.payload.command == 'cc-fork'", steps: [action("CC: Fork", { label: "cc-fork", map: { command: "$.event.data.payload.command", text: "$.event.data.payload.text", threadId: "$.event.data.payload.threadId", references: "$.event.data.payload.references" } })] },
                 { if: "$.event.data.payload.command == 'cc-context'", steps: [action("CC: Context", { label: "cc-context", map: { command: "$.event.data.payload.command", text: "$.event.data.payload.text", threadId: "$.event.data.payload.threadId", references: "$.event.data.payload.references" } })] },
                 { if: "$.event.data.payload.command == 'cc-recap'", steps: [action("CC: Recap", { label: "cc-recap", map: { command: "$.event.data.payload.command", text: "$.event.data.payload.text", threadId: "$.event.data.payload.threadId" } })] },
+                { if: "$.event.data.payload.command == 'cc-goal'", steps: [action("CC: Goal", { label: "cc-goal", map: { command: "$.event.data.payload.command", text: "$.event.data.payload.text", threadId: "$.event.data.payload.threadId", references: "$.event.data.payload.references" } })] },
                 // Directory operations (add-dir, set-dir) — share path helpers
                 { if: "$.event.data.payload.command == 'cc-add-dir'", steps: [action("CC: Dir Ops", { label: "cc-add-dir", map: { command: "$.event.data.payload.command", text: "$.event.data.payload.text", threadId: "$.event.data.payload.threadId", references: "$.event.data.payload.references" } })] },
                 { if: "$.event.data.payload.command == 'cc-set-dir'", steps: [action("CC: Dir Ops", { label: "cc-set-dir", map: { command: "$.event.data.payload.command", text: "$.event.data.payload.text", threadId: "$.event.data.payload.threadId", references: "$.event.data.payload.references" } })] },
@@ -329,26 +353,33 @@ export default {
     ),
     // ─── DB query generation ──────────────────────────────────────────
     // The database system forwards GENERATE_AI_QUERY as a db.query brain
-    // event. Routes to the appropriate action based on mode.
+    // event. Gated on provider, then routes by mode.
     on(
       "db.query",
       [[
         branch([
           {
-            if: "$.event.data.payload.mode == 'transaction'",
+            if: "$.event.data.payload.provider == 'Claude Code'",
             steps: [
-              action("CC: DB Transaction", {
-                label: "db-transaction",
-                map: { prompt: "$.event.data.payload.prompt" },
-              }),
+              branch([
+                {
+                  if: "$.event.data.payload.mode == 'transaction'",
+                  steps: [
+                    action("CC: DB Transaction", {
+                      label: "db-transaction",
+                      map: { prompt: "$.event.data.payload.prompt" },
+                    }),
+                  ],
+                },
+              ], [
+                action("CC: DB Query", {
+                  label: "db-query",
+                  map: { prompt: "$.event.data.payload.prompt" },
+                }),
+              ], "DB Mode Router"),
             ],
           },
-        ], [
-          action("CC: DB Query", {
-            label: "db-query",
-            map: { prompt: "$.event.data.payload.prompt" },
-          }),
-        ], "DB Mode Router"),
+        ], undefined, "CC Provider Gate"),
       ]],
       "DB query generation",
     ),
@@ -356,14 +387,21 @@ export default {
     on(
       "commit.generate",
       [[
-        action("CC: Commit Message", {
-          label: "commit-message",
-          map: {
-            diff: "$.event.data.payload.diff",
-            branch: "$.event.data.payload.branch",
-            repoName: "$.event.data.payload.repoName",
+        branch([
+          {
+            if: "$.event.data.payload.provider == 'Claude Code'",
+            steps: [
+              action("CC: Commit Message", {
+                label: "commit-message",
+                map: {
+                  diff: "$.event.data.payload.diff",
+                  branch: "$.event.data.payload.branch",
+                  repoName: "$.event.data.payload.repoName",
+                },
+              }),
+            ],
           },
-        }),
+        ], undefined, "CC Commit Gate"),
       ]],
       "Commit message generation",
     ),

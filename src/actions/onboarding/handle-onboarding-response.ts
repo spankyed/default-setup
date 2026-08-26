@@ -29,7 +29,10 @@ export async function action(
   }
 
   if (state.step === 'complete') {
-    return { success: false, reason: 'already-complete' };
+    if (response && typeof response === 'string') {
+      services.chat.openThreadChatAndRefreshRecent(response as EntityId);
+    }
+    return { success: true, step: 'complete', threadId, response };
   }
 
   if (params.messageId !== state.pendingMessageId) {

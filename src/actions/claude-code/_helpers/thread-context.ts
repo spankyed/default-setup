@@ -84,6 +84,8 @@ export interface ClaudeCodeThreadState {
   permissionMode?: PermissionMode;
   /** Whether to run in a git worktree for isolated file mutations. */
   useWorktree?: boolean;
+  /** Whether the current sessionId was created with --worktree. */
+  sessionWorktree?: boolean;
   /** Human-readable error when the session is broken (e.g. JSONL deleted). */
   sessionError?: string;
   /** Threshold percentages that have already fired an alert (avoids re-alerting). */
@@ -136,6 +138,13 @@ export interface ClaudeCodeThreadState {
    */
   forkFrom?: { sessionId: string; cliUuid?: string };
   /**
+   * Set by the backend forkThread action before navigation. While true,
+   * the chat action queues incoming messages until handle-fork finishes
+   * persisting session state (sessionId, forkFrom, cwd). Cleared by
+   * CC: Handle Fork after state is ready.
+   */
+  forkPending?: boolean;
+  /**
    * One-shot flag set by CC: Handle Revert. When present, the next chat
    * action passes `--resume-session-at <cliUuid> --fork-session` to the CLI
    * so it creates a new session truncated to the revert point. Cleared after
@@ -148,6 +157,15 @@ export interface ClaudeCodeThreadState {
   cwdOverride?: string;
   /** When true, force the directory picker on first message regardless of global defaultBaseDirectory. */
   forceDirectoryPicker?: boolean;
+  /** Active goal-loop state. Set by CC: Goal, cleared on met/failed/clear. */
+  goal?: {
+    condition: string;
+    setAt: number;
+    status: 'active' | 'met' | 'failed';
+    iterations: number;
+    /** Permission mode before auto-elevation, restored when goal ends. */
+    prevPermissionMode?: PermissionMode;
+  };
 }
 
 export const CLAUDE_CODE_TAG = 'claude-code';
@@ -248,7 +266,7 @@ export function ensureSessionMarker(services: Services, threadId: EntityId): Ent
   const { artifactId } = services.artifact.findOrCreateByType(
     threadId,
     'claude-session',
-    { title: 'Claude Code session', content: {} },
+    { title: 'Claude Code session', content: {}, color: 'purple' },
   );
   return artifactId;
 }
@@ -298,8 +316,37 @@ export function markSessionBroken(
   persistClaudeState(services, threadId as string, {
     sessionError: errorMessage,
     sessionId: undefined,
+    sessionWorktree: undefined,
   });
   updateChatState(services, threadId, 'error');
+}
+
+// ─── Goal helpers ────────────────────────────────────────────────────────────
+
+/**
+ * End an active goal: restore the prior permission mode and either update the
+ * goal status (met/failed — kept for UI display) or remove it entirely
+ * (explicit clear).
+ */
+export function endGoal(
+  services: Services,
+  threadId: string,
+  status: 'met' | 'failed' | undefined,
+): void {
+  const state = getClaudeState(services, threadId);
+  if (!state?.goal) return;
+  const restore = state.goal.prevPermissionMode ?? 'default';
+  if (status) {
+    persistClaudeState(services, threadId, {
+      goal: { ...state.goal, status },
+      permissionMode: restore,
+    });
+  } else {
+    persistClaudeState(services, threadId, {
+      goal: undefined,
+      permissionMode: restore,
+    });
+  }
 }
 
 // ─── Concurrency helpers ─────────────────────────────────────────────────────

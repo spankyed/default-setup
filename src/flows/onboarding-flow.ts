@@ -1,5 +1,5 @@
 import type { FlowDSL } from '../types';
-import { entry, on, keepAlive, action, branch } from './_patterns';
+import { entry, on, keepAlive, action, branch, killFlow } from './_patterns';
 
 export default {
   "Onboarding Flow": [
@@ -30,18 +30,6 @@ export default {
           ],
         },
         {
-          if: "$.lastStep.result.step == 'cli-test-ask'",
-          steps: [
-            action("Handle CLI Test Step", {
-              label: "cli-test",
-              map: {
-                threadId: "$.steps[label=route-response].result.threadId",
-                response: "$.steps[label=route-response].result.response",
-              },
-            }),
-          ],
-        },
-        {
           if: "$.lastStep.result.step == 'projects'",
           steps: [
             action("Handle Projects Step", {
@@ -56,7 +44,7 @@ export default {
         {
           if: "$.lastStep.result.step == 'import-threads'",
           steps: [
-            action("Handle CC Import Threads Step", {
+            action("Handle Import Threads Step", {
               label: "import-threads",
               map: {
                 threadId: "$.steps[label=route-response].result.threadId",
@@ -78,15 +66,22 @@ export default {
           ],
         },
         {
-          if: "$.lastStep.result.step == 'hermes-setup'",
+          if: "$.lastStep.result.step == 'choose-mode'",
           steps: [
-            action("Handle Hermes Setup Step", {
-              label: "hermes-setup",
+            action("Handle Choose Mode Step", {
+              label: "choose-mode",
               map: {
                 threadId: "$.steps[label=route-response].result.threadId",
                 response: "$.steps[label=route-response].result.response",
               },
             }),
+            killFlow(),
+          ],
+        },
+        {
+          if: "$.lastStep.result.step == 'complete'",
+          steps: [
+            killFlow('Onboarding Complete'),
           ],
         },
       ]),
