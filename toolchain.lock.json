@@ -1,11 +1,11 @@
 {
-  "commit": "51fc6bd6cd9196f6dc8fb12d714e43bfbafe308c",
-  "tag": "toolchain-51fc6bd6cd9196f6dc8fb12d714e43bfbafe308c",
+  "commit": "57519bc74330d011a0e73a87cce5900bde00fe83",
+  "tag": "toolchain-57519bc74330d011a0e73a87cce5900bde00fe83",
   "packages": {
     "@apackdev/sdk": {
       "version": "0.1.0",
       "file": "apackdev-sdk-0.1.0.tgz",
-      "sha256": "2057818de01d976418a2b5ad911f3786aad88e14290599682753eb07a3a076bf"
+      "sha256": "77e8b78c5c49c6c81e18a702bc292c373fe95db111a62f8b8b3ccd6c35bb3f1d"
     },
     "@apackdev/ui": {
       "version": "0.1.0",
@@ -15,12 +15,12 @@
     "@apackdev/testing": {
       "version": "0.1.0",
       "file": "apackdev-testing-0.1.0.tgz",
-      "sha256": "46b051a011e46fda4bebe916499f78abd2ed676991f1d135d682d5f04f3a5d94"
+      "sha256": "1dae280dc143c0090f171cc398b4989bb03ea4c220694db5cbb134b7e486b890"
     },
     "@apackdev/cli": {
       "version": "0.1.0",
       "file": "apackdev-cli-0.1.0.tgz",
-      "sha256": "3a88fbe1da48541b6e0f4e64acf7bd3580a487b042f7b9d0e691ac5e25268ec2"
+      "sha256": "7c7bc39e5d7a0b53594b0ec191f7c04cd1d8bd26ed79bc56b9d1d2fce103731c"
     }
   },
   "upstream": {
@@ -29,5 +29,9 @@
     "@apackdev/git": "https://github.com/spankyed/apack-git/releases/download/pkg-0be7efd71616356cf31fcf6ac9f33ad469481683/apackdev-git-0.1.0.tgz",
     "@apackdev/terminal": "https://github.com/spankyed/apack-terminal/releases/download/bin-8816ce8efd9a2a26d2a4cbff291cd433580f61bd/apackdev-terminal-0.1.0.tgz",
     "@apackdev/terminal-view": "https://github.com/spankyed/apack-terminal/releases/download/bin-8816ce8efd9a2a26d2a4cbff291cd433580f61bd/apackdev-terminal-view-0.1.0.tgz"
+  },
+  "evidenceTool": {
+    "file": "pack-release-evidence.mjs",
+    "sha256": "8b584c790618e12c331d71a4f5913a6761cd8e0ba148bbdac7fa135e933c9011"
   }
 }

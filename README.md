@@ -26,3 +26,7 @@ Use `npm run dev -- --host /path/to/apack` to work against a selected host. Use 
 ## Release
 
 The release-candidate workflow runs the pack checks and saves the ordinary archive, its checksum and the source credits for inspection. It uses the same toolchain lock as local development. Publishing the first production release requires an approved hosted toolchain, the complete redistribution inventory and an explicit publication decision.
+
+## Publishing
+
+The release workflow builds the exact commit, verifies its archive and redistribution evidence, and keeps those files together. For publication, tag an approved commit on main. The tag workflow publishes the verified candidate from its build job. Pull requests produce a checked candidate for review.

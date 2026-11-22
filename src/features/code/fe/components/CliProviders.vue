@@ -56,6 +56,11 @@ const providers = [
       result.value = { status: 'testing' }
       try {
         const outcome = await ask('code', { type: 'TEST_CLI_PROVIDER', provider: key, path })
+        const resolvedPath = outcome.ok && outcome.value.success ? outcome.value.resolvedPath : undefined
+        if (draft.value !== path && draft.value !== resolvedPath) {
+          result.value = undefined
+          return
+        }
         if (!outcome.ok) {
           result.value = { status: 'error', error: outcome.failure.message }
         } else if (outcome.value.success) {
@@ -64,7 +69,7 @@ const providers = [
           result.value = { status: 'error', error: outcome.value.error }
         }
       } catch (error) {
-        result.value = { status: 'error', error: errorMessage(error) }
+        result.value = draft.value === path ? { status: 'error', error: errorMessage(error) } : undefined
       }
     },
   }

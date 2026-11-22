@@ -29,9 +29,9 @@
   "dependencies": {
     "@antv/g6": "^5.0.48",
     "@apackdev/git": "https://github.com/spankyed/apack-git/releases/download/pkg-0be7efd71616356cf31fcf6ac9f33ad469481683/apackdev-git-0.1.0.tgz",
-    "@apackdev/sdk": "file:.apack/toolchain/toolchain-51fc6bd6cd9196f6dc8fb12d714e43bfbafe308c/apackdev-sdk-0.1.0.tgz",
+    "@apackdev/sdk": "file:.apack/toolchain/toolchain-57519bc74330d011a0e73a87cce5900bde00fe83/apackdev-sdk-0.1.0.tgz",
     "@apackdev/terminal-view": "https://github.com/spankyed/apack-terminal/releases/download/bin-8816ce8efd9a2a26d2a4cbff291cd433580f61bd/apackdev-terminal-view-0.1.0.tgz",
-    "@apackdev/ui": "file:.apack/toolchain/toolchain-51fc6bd6cd9196f6dc8fb12d714e43bfbafe308c/apackdev-ui-0.1.0.tgz",
+    "@apackdev/ui": "file:.apack/toolchain/toolchain-57519bc74330d011a0e73a87cce5900bde00fe83/apackdev-ui-0.1.0.tgz",
     "@floating-ui/vue": "^1.1.11",
     "@leeoniya/ufuzzy": "^1.0.18",
     "@vscode/ripgrep": "^1.17.1",
@@ -51,8 +51,8 @@
     "xstate": "5.30.0"
   },
   "devDependencies": {
-    "@apackdev/cli": "file:.apack/toolchain/toolchain-51fc6bd6cd9196f6dc8fb12d714e43bfbafe308c/apackdev-cli-0.1.0.tgz",
-    "@apackdev/testing": "file:.apack/toolchain/toolchain-51fc6bd6cd9196f6dc8fb12d714e43bfbafe308c/apackdev-testing-0.1.0.tgz",
+    "@apackdev/cli": "file:.apack/toolchain/toolchain-57519bc74330d011a0e73a87cce5900bde00fe83/apackdev-cli-0.1.0.tgz",
+    "@apackdev/testing": "file:.apack/toolchain/toolchain-57519bc74330d011a0e73a87cce5900bde00fe83/apackdev-testing-0.1.0.tgz",
     "@tiptap/core": "3.32.0",
     "@tiptap/pm": "3.32.0",
     "@tiptap/starter-kit": "3.32.0",
