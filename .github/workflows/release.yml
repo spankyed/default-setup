@@ -1,0 +1,44 @@
+name: Build starter release candidate
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  candidate:
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24.22.2
+      - run: npm install --global npm@11.21.1
+      - name: Check release tag
+        if: github.ref_type == 'tag'
+        run: test "v$(node -p "require('./apack.json').version")" = "$GITHUB_REF_NAME"
+      - run: npm run toolchain
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - run: npm ci
+      - run: npm run validate
+      - run: npm run typecheck
+      - run: npm run build
+      - run: npm run facade:check
+      - run: npm test
+      - run: npm run archive -- --out "$RUNNER_TEMP/starter-release"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: default-setup-candidate
+          path: |
+            ${{ runner.temp }}/starter-release/
+            LICENSE
+            NOTICE
+            licenses/
+          if-no-files-found: error

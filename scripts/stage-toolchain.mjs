@@ -1,17 +1,32 @@
-// Phase 0 obtains the pack author's npm packages from apack's staged publication trees.
-import { mkdirSync, existsSync } from 'node:fs';
-import { resolve, join } from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const checkout = process.argv[2];
-if (!checkout) throw new Error('Usage: npm run toolchain -- <prepared-apack-checkout>');
-const destination = resolve('.apack/toolchain');
-mkdirSync(destination, { recursive: true });
-const npm = process.env.npm_execpath;
-for (const tree of ['apack-sdk/publish', 'apack-cli/dist/package', 'apack-testing/dist/package']) {
-  const cwd = resolve(checkout, 'packages', tree);
-  if (!existsSync(join(cwd, 'package.json'))) {
-    throw new Error('Missing ' + cwd + '. Run npm run packages:ensure in the apack checkout.');
+const [localDirectory, ...extra] = process.argv.slice(2);
+if (extra.length) throw new Error('Usage: npm run toolchain -- [verified-toolchain-directory]');
+
+const root = fileURLToPath(new URL('..', import.meta.url));
+const lock = JSON.parse(readFileSync(join(root, 'toolchain.lock.json'), 'utf8'));
+const destination = join(root, '.apack', 'toolchain');
+const scratch = mkdtempSync(join(tmpdir(), 'default-setup-toolchain-'));
+const files = Object.values(lock.packages);
+
+try {
+  if (localDirectory) {
+    for (const { file } of files) copyFileSync(join(resolve(localDirectory), file), join(scratch, file));
+  } else {
+    execFileSync('gh', ['release', 'download', lock.tag, '--repo', 'spankyed/apack', '--dir', scratch,
+      ...files.flatMap(({ file }) => ['--pattern', file])], { stdio: 'inherit' });
   }
-  execFileSync(process.execPath, [npm, 'pack', '--silent', '--pack-destination', destination], { cwd, stdio: 'inherit' });
+  for (const { file, sha256 } of files) {
+    const actual = createHash('sha256').update(readFileSync(join(scratch, file))).digest('hex');
+    if (actual !== sha256) throw new Error(`Toolchain checksum mismatch for ${file}`);
+  }
+  mkdirSync(destination, { recursive: true });
+  for (const { file } of files) copyFileSync(join(scratch, file), join(destination, file));
+} finally {
+  rmSync(scratch, { recursive: true, force: true });
 }

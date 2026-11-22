@@ -1,8 +1,8 @@
 node_modules/
 dist/
-.apack/
 src/__generated__/
-*.tgz
-.DS_Store
+.apack/
 .env
+.DS_Store
+*.tgz
 .claude/settings.local.json

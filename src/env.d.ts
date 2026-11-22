@@ -1,6 +1,8 @@
-// Plain `tsc` can't read .vue files, so the pack's own single-file components resolve to a
-// generic component here. @apackdev/ui components ship declarations and keep their prop types.
-// Checking inside SFCs needs vue-tsc.
+/// <reference types="vite/client" />
+
+// Pack FE code imports single-file components. The pack's `typecheck` script is
+// plain `tsc`, which cannot read .vue files, so they resolve to a generic
+// component here. Checking *inside* the SFCs needs vue-tsc and is not wired up.
 declare module '*.vue' {
   import type { DefineComponent } from 'vue';
   const component: DefineComponent<Record<string, unknown>, Record<string, unknown>, any>;

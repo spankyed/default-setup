@@ -1,29 +1,28 @@
 # Default Setup
 
-This repository will own the starter pack shipped with apack. Phase 0 establishes its manifest, local CLI, tests, and archive build. The app still ships the implementation in `packages/default-setup` in the apack repository. Both use the ID `default-setup`. Use a disposable profile for experiments with this scaffold.
+Default Setup is an ordinary apack pack. It contains the starter features, flow steps and content used by the official app. Its pack ID is `default-setup`.
 
-## Build from a clean checkout
+This transfer starts from [apack d54dcff6f3](https://github.com/spankyed/apack/tree/d54dcff6f3538f02cf4ed81025e97b2b735e47f3/packages/default-setup). The official app still uses its in-tree copy until its distribution pins a published archive. Until that cutover, record fixes made to the old workspace and bring them over before publishing.
 
-Use Node 24.12 or later and npm 11. Phase 0 uses the staged npm packages from an apack checkout. The lockfile was generated with apack commit `19adecce0dea21a81412bcd35528af85a29d36b9`. Prepare that checkout with `npm ci` and `npm run packages:ensure`, then run these commands here. The checkout can be anywhere.
+## Build and test
+
+Use Node 24.12 or later, npm 11, and the GitHub CLI. Stage the exact toolchain in `toolchain.lock.json` before installing.
 
 ```sh
-npm run toolchain -- /path/to/apack
+npm run toolchain
 npm ci
 npm run validate
 npm run typecheck
-npm test
 npm run build
 npm run facade:check
+npm test
 npm run archive
 ```
 
-The first command creates three local npm tarballs in `.apack/toolchain/`. The lockfile checks their integrity. All subsequent commands use the installed project-local toolchain. The build writes `dist/`. The archive command writes an installable pack and its checksum under `.apack/archives/`.
+The current lock points to a verified local candidate. Until the hosted toolchain is published, use `npm run toolchain -- /path/to/staged-toolchain` with the candidate directory. This path checks the same hashes as the hosted path. All later commands use the project-local CLI, with no sibling checkout or globally installed apack required.
 
-## Extraction plan
+Use `npm run dev -- --host /path/to/apack` to work against a selected host. Use a disposable profile when testing this pack alongside the app's shipped copy, since both use the same pack ID.
 
-1. Establish an installable pack with an empty feature set in this repository. Keep the pre-pack implementation in Git history at `482bc73`.
-2. Make the desktop build consume verified release layouts. Prove it with the existing starter, a different pack ID, and an empty selection. Exercise offline startup, replacement, and upgrades.
-3. Provide immutable, independently retrievable toolchain packages and enable clean-runner CI. Port features, content, tests, and redistribution notices from the current in-app pack. Compare behavior in isolated host profiles.
-4. Publish the first complete starter release, pin its archive and digest in the app, and validate packaged builds on the shipping platforms before removing the monorepo copy.
+## Release
 
-A Phase 0 archive exercises the release format. The first release intended for app distribution comes after feature migration and acceptance.
+The release-candidate workflow runs the pack checks and saves the ordinary archive, its checksum and the source credits for inspection. It uses the same toolchain lock as local development. Publishing the first production release requires an approved hosted toolchain, the complete redistribution inventory and an explicit publication decision.

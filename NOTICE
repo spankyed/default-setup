@@ -1,0 +1,5 @@
+Default Setup includes code adapted from the OpenAI Codex goal templates in
+src/content/actions/codex/_helpers/goal-prompts.ts.
+Upstream: https://github.com/openai/codex
+Upstream path: codex-rs/ext/goal/templates/goals
+License: Apache-2.0. See licenses/codex-LICENSE and licenses/codex-NOTICE.
