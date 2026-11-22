@@ -16,7 +16,7 @@ npm run typecheck
 npm run build
 npm run facade:check
 npm test
-npm run archive
+npm run export
 ```
 
 The current lock points to a verified local candidate. Until the hosted toolchain is published, use `npm run toolchain -- /path/to/staged-toolchain` with the candidate directory. This path checks the same hashes as the hosted path. Each toolchain is staged under its release tag so npm refreshes integrity when a new toolchain keeps the same package versions. All later commands use the project-local CLI, with no sibling checkout or globally installed apack required.

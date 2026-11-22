@@ -32,7 +32,7 @@ jobs:
       - run: npm run build -- --release
       - run: npm run facade:check
       - run: npm test
-      - run: npm run archive -- --out "$RUNNER_TEMP/starter-release"
+      - run: npm run export -- --out "$RUNNER_TEMP/starter-release"
       - name: Include the bundled Vue Flow stylesheet license
         run: cp node_modules/@vue-flow/core/LICENSE "$RUNNER_TEMP/starter-release/vue-flow-LICENSE"
       - uses: actions/upload-artifact@v4

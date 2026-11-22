@@ -1,6 +1,6 @@
 {
-  "commit": "d51cbdec82b2aaaf2d0ba48cb8a7b39b436957ce",
-  "tag": "toolchain-d51cbdec82b2aaaf2d0ba48cb8a7b39b436957ce",
+  "commit": "51fc6bd6cd9196f6dc8fb12d714e43bfbafe308c",
+  "tag": "toolchain-51fc6bd6cd9196f6dc8fb12d714e43bfbafe308c",
   "packages": {
     "@apackdev/sdk": {
       "version": "0.1.0",
@@ -20,7 +20,7 @@
     "@apackdev/cli": {
       "version": "0.1.0",
       "file": "apackdev-cli-0.1.0.tgz",
-      "sha256": "605ac6614f19c287b2a4cb0758b0886be7036ca7234039028e41192029621d3f"
+      "sha256": "3a88fbe1da48541b6e0f4e64acf7bd3580a487b042f7b9d0e691ac5e25268ec2"
     }
   },
   "upstream": {
