@@ -2,7 +2,7 @@
 
 Default Setup is an ordinary apack pack. It contains the starter features, flow steps and content used by the official app. Its pack ID is `default-setup`.
 
-This transfer starts from [apack d54dcff6f3](https://github.com/spankyed/apack/tree/d54dcff6f3538f02cf4ed81025e97b2b735e47f3/packages/default-setup). The official app still uses its in-tree copy until its distribution pins a published archive. Until that cutover, record fixes made to the old workspace and bring them over before publishing.
+This transfer starts from [apack d54dcff6f3](https://github.com/spankyed/apack/tree/d54dcff6f3538f02cf4ed81025e97b2b735e47f3/packages/default-setup). The official app still uses its in-tree copy until its distribution pins a published archive. Until that cutover, record fixes made to the old workspace and bring them over before publishing. This transfer also includes the pack-owned Code settings from [apack PR #613](https://github.com/spankyed/apack/pull/613) at `459ec093e1`.
 
 ## Build and test
 
