@@ -1,0 +1,12 @@
+{
+  "$schema": "./node_modules/@apackdev/sdk/apack.schema.json",
+  "id": "default-setup",
+  "name": "Default Setup",
+  "version": "0.1.0",
+  "hostVersion": ">=0.3.0",
+  "dependencies": {},
+  "permissions": [],
+  "features": {},
+  "description": "The apack starter pack.",
+  "license": "MIT"
+}

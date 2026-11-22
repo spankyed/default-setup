@@ -1,23 +1,40 @@
 {
-  "name": "default-setup",
+  "name": "@apack-pack/default-setup",
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "imports": {
+    "#generated/*": "./src/__generated__/*"
+  },
   "scripts": {
-    "compile:actions": "tsx build/compile.ts actions",
-    "compile:prompts": "tsx build/compile.ts prompts",
-    "compile:flows": "tsx build/compile.ts flows",
-    "compile:library": "tsx build/compile.ts library",
-    "compile:notes": "tsx build/compile.ts notes",
-    "compile": "npm run compile:actions && npm run compile:prompts && npm run compile:flows && npm run compile:library && npm run compile:notes",
-    "pipeline": "bash scripts/pipeline.sh",
-    "typecheck": "tsc --noEmit"
+    "prepare": "apack pack generate-entries",
+    "build": "apack pack build",
+    "validate": "apack pack validate",
+    "dev": "apack pack dev",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "facade:check": "apack pack facade-report",
+    "facade:update": "apack pack facade-report --update",
+    "toolchain": "node scripts/stage-toolchain.mjs",
+    "archive": "apack pack archive"
+  },
+  "dependencies": {
+    "@apackdev/sdk": "file:.apack/toolchain/apackdev-sdk-0.1.0.tgz",
+    "zod": "^4.6.7"
   },
   "devDependencies": {
-    "@types/node": "^25.5.0",
-    "esbuild": "^0.25.0",
-    "tsx": "^4.19.4",
-    "typescript": "^5.8.3",
-    "zod": "^3.24.0"
+    "@apackdev/cli": "file:.apack/toolchain/apackdev-cli-0.1.0.tgz",
+    "@apackdev/testing": "file:.apack/toolchain/apackdev-testing-0.1.0.tgz",
+    "vitest": "^4.1.12",
+    "@types/node": "^22.15.17",
+    "typescript": "^5.8.3"
+  },
+  "engines": {
+    "node": ">=24.12.0",
+    "npm": ">=11"
+  },
+  "overrides": {
+    "elmdb": "https://github.com/spankyed/elmdb/releases/download/pkg-89c77cd299929233b1c9d7deee811065320a20a4/elmdb-0.1.0.tgz",
+    "@elmdb/ears": "https://github.com/spankyed/elmdb/releases/download/pkg-89c77cd299929233b1c9d7deee811065320a20a4/elmdb-ears-0.1.0.tgz"
   }
 }
