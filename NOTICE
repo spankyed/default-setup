@@ -3,3 +3,7 @@ src/content/actions/codex/_helpers/goal-prompts.ts.
 Upstream: https://github.com/openai/codex
 Upstream path: codex-rs/ext/goal/templates/goals
 License: Apache-2.0. See licenses/codex-LICENSE and licenses/codex-NOTICE.
+
+The Flows canvas redistributes style.css and theme-default.css from
+@vue-flow/core under the MIT license. The release candidate includes
+vue-flow-LICENSE from the exact installed dependency.
