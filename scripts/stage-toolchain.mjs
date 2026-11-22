@@ -10,7 +10,7 @@ if (extra.length) throw new Error('Usage: npm run toolchain -- [verified-toolcha
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 const lock = JSON.parse(readFileSync(join(root, 'toolchain.lock.json'), 'utf8'));
-const destination = join(root, '.apack', 'toolchain');
+const destination = join(root, '.apack', 'toolchain', lock.tag);
 const scratch = mkdtempSync(join(tmpdir(), 'default-setup-toolchain-'));
 const files = Object.values(lock.packages);
 
