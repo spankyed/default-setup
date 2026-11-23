@@ -12,8 +12,8 @@ const root = fileURLToPath(new URL('..', import.meta.url));
 const lock = JSON.parse(readFileSync(join(root, 'toolchain.lock.json'), 'utf8'));
 const destination = join(root, '.apack', 'toolchain', lock.tag);
 const scratch = mkdtempSync(join(tmpdir(), 'default-setup-toolchain-'));
-if (!lock.evidenceTool) throw new Error('The pinned toolchain does not include the pack release evidence tool.');
-const files = [...Object.values(lock.packages), lock.evidenceTool];
+if (!lock.evidenceTool?.notices) throw new Error('The pinned toolchain must include the evidence tool and its notices.');
+const files = [...Object.values(lock.packages), lock.evidenceTool, lock.evidenceTool.notices];
 
 try {
   if (localDirectory) {

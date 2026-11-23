@@ -29,4 +29,4 @@ The release-candidate workflow runs the pack checks and saves the ordinary archi
 
 ## Publishing
 
-The release workflow builds the exact commit, verifies its archive and redistribution evidence, and keeps those files together. For publication, tag an approved commit on main. The tag workflow publishes the verified candidate from its build job. Pull requests produce a checked candidate for review.
+The release workflow builds the exact commit, verifies its archive and redistribution evidence, and keeps those files together. For publication, tag an approved commit on main. The tag workflow publishes the verified candidate from its build job. Pull requests produce a checked candidate for review. If publication is interrupted, rerun the workflow for the existing tag. The pack requires the verified notices, license and SBOM on every publish.

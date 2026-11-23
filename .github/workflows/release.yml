@@ -45,7 +45,7 @@ jobs:
         run: |
           toolchain=$(node -p "require('./toolchain.lock.json').tag")
           node ".apack/toolchain/$toolchain/pack-release-evidence.mjs" "$PWD" "$RUNNER_TEMP/starter-release"
-          npx --no-install apack pack release publish --dir "$RUNNER_TEMP/starter-release" --require-redistribution --dry-run
+          npx --no-install apack pack release publish --dir "$RUNNER_TEMP/starter-release" --dry-run
           node -e 'const file = require(process.argv[1]); if (file.provenance?.commit !== process.env.EXPECTED_SOURCE_COMMIT) throw new Error("Archive source does not match this run");' "$RUNNER_TEMP/starter-release/default-setup-$(node -p "require('./apack.json').version").tgz.integrity.json"
       - uses: actions/upload-artifact@v4
         with:
@@ -76,6 +76,6 @@ jobs:
         with:
           name: default-setup-candidate
           path: ${{ runner.temp }}/starter-release
-      - run: npx --no-install apack pack release publish --dir "$RUNNER_TEMP/starter-release" --require-redistribution
+      - run: npx --no-install apack pack release publish --dir "$RUNNER_TEMP/starter-release"
         env:
           GH_TOKEN: ${{ github.token }}

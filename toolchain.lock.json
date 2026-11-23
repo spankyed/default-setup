@@ -1,6 +1,6 @@
 {
-  "commit": "57519bc74330d011a0e73a87cce5900bde00fe83",
-  "tag": "toolchain-57519bc74330d011a0e73a87cce5900bde00fe83",
+  "commit": "9ae55b71c480b99ef160557ec50acad6cbddf920",
+  "tag": "toolchain-9ae55b71c480b99ef160557ec50acad6cbddf920",
   "packages": {
     "@apackdev/sdk": {
       "version": "0.1.0",
@@ -15,12 +15,12 @@
     "@apackdev/testing": {
       "version": "0.1.0",
       "file": "apackdev-testing-0.1.0.tgz",
-      "sha256": "1dae280dc143c0090f171cc398b4989bb03ea4c220694db5cbb134b7e486b890"
+      "sha256": "0f56ed8b60427b0334ee85bbbae69ef15cbaf17db1402b23abb6b60b26191342"
     },
     "@apackdev/cli": {
       "version": "0.1.0",
       "file": "apackdev-cli-0.1.0.tgz",
-      "sha256": "7c7bc39e5d7a0b53594b0ec191f7c04cd1d8bd26ed79bc56b9d1d2fce103731c"
+      "sha256": "824f2a170e7cfef021d8309cfaaa4ece440494211e6956426a8622e26b72caf3"
     }
   },
   "upstream": {
@@ -32,6 +32,10 @@
   },
   "evidenceTool": {
     "file": "pack-release-evidence.mjs",
-    "sha256": "8b584c790618e12c331d71a4f5913a6761cd8e0ba148bbdac7fa135e933c9011"
+    "sha256": "42728d0b72a4f4c79fff103fc99e268ac452a260369fc528464db5d028ca075a",
+    "notices": {
+      "file": "pack-release-evidence.NOTICES.txt",
+      "sha256": "7cc5bae1f8fea7c6c7c8fcfd1a5e3567b26fb9e4a5a06819e5219db3ff185838"
+    }
   }
 }
