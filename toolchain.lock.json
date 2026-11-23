@@ -1,0 +1,41 @@
+{
+  "commit": "4d3ad7b9a43355cda3c0d6d33b859048895d7cca",
+  "tag": "toolchain-4d3ad7b9a43355cda3c0d6d33b859048895d7cca",
+  "packages": {
+    "@apackdev/sdk": {
+      "version": "0.1.0",
+      "file": "apackdev-sdk-0.1.0.tgz",
+      "sha256": "77e8b78c5c49c6c81e18a702bc292c373fe95db111a62f8b8b3ccd6c35bb3f1d"
+    },
+    "@apackdev/ui": {
+      "version": "0.1.0",
+      "file": "apackdev-ui-0.1.0.tgz",
+      "sha256": "8031b4b7070a2ac2ae752379b5afccf42d65f8bbdb5191db7d93198c6b616402"
+    },
+    "@apackdev/testing": {
+      "version": "0.1.0",
+      "file": "apackdev-testing-0.1.0.tgz",
+      "sha256": "0f56ed8b60427b0334ee85bbbae69ef15cbaf17db1402b23abb6b60b26191342"
+    },
+    "@apackdev/cli": {
+      "version": "0.1.0",
+      "file": "apackdev-cli-0.1.0.tgz",
+      "sha256": "824f2a170e7cfef021d8309cfaaa4ece440494211e6956426a8622e26b72caf3"
+    }
+  },
+  "upstream": {
+    "elmdb": "https://github.com/spankyed/elmdb/releases/download/pkg-89c77cd299929233b1c9d7deee811065320a20a4/elmdb-0.1.0.tgz",
+    "@elmdb/ears": "https://github.com/spankyed/elmdb/releases/download/pkg-89c77cd299929233b1c9d7deee811065320a20a4/elmdb-ears-0.1.0.tgz",
+    "@apackdev/git": "https://github.com/spankyed/apack-git/releases/download/pkg-0be7efd71616356cf31fcf6ac9f33ad469481683/apackdev-git-0.1.0.tgz",
+    "@apackdev/terminal": "https://github.com/spankyed/apack-terminal/releases/download/bin-8816ce8efd9a2a26d2a4cbff291cd433580f61bd/apackdev-terminal-0.1.0.tgz",
+    "@apackdev/terminal-view": "https://github.com/spankyed/apack-terminal/releases/download/bin-8816ce8efd9a2a26d2a4cbff291cd433580f61bd/apackdev-terminal-view-0.1.0.tgz"
+  },
+  "evidenceTool": {
+    "file": "pack-release-evidence.mjs",
+    "sha256": "42728d0b72a4f4c79fff103fc99e268ac452a260369fc528464db5d028ca075a",
+    "notices": {
+      "file": "pack-release-evidence.NOTICES.txt",
+      "sha256": "7cc5bae1f8fea7c6c7c8fcfd1a5e3567b26fb9e4a5a06819e5219db3ff185838"
+    }
+  }
+}

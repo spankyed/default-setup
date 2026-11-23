@@ -1,6 +1,16 @@
+import { defineConfig } from 'vitest/config';
 import { definePackTestConfig } from '@apackdev/testing/vitest';
 
-// Everything a pack's suite needs: a throwaway data dir per run (the harness requires one), the suite's
-// timeouts, `tests/**/*.spec.ts`, and a stub for this pack's .vue files so `vitest related` can walk its
-// module graph. Pass { vue: true } — with @vitejs/plugin-vue installed — to compile and render them instead.
-export default definePackTestConfig();
+// Backend tests keep their in-memory runtime and SFC stubs. Frontend tests compile real views in
+// jsdom, without importing the backend harness into its browser realm. Both use published packages.
+const backend = await definePackTestConfig({ dataDirPrefix: 'default-setup-tests-' });
+const frontend = await definePackTestConfig({ dataDirPrefix: 'default-setup-frontend-tests-', vue: true, setupFiles: [] });
+
+export default defineConfig({
+  test: {
+    projects: [
+      { ...backend, test: { ...backend.test, name: '@app/default-setup:backend', include: ['tests/**/!(*.frontend).spec.ts'] } },
+      { ...frontend, test: { ...frontend.test, name: '@app/default-setup:frontend', environment: 'jsdom', server: { deps: { inline: ['@apackdev/ui'] } }, include: ['tests/**/*.frontend.spec.ts'] } },
+    ],
+  },
+});

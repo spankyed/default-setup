@@ -1,0 +1,81 @@
+name: Build and verify starter release
+
+on:
+  pull_request:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+concurrency:
+  group: starter-release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  candidate:
+    runs-on: macos-26
+    timeout-minutes: 30
+    env:
+      EXPECTED_SOURCE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.EXPECTED_SOURCE_COMMIT }}
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24.22.2
+      - run: npm install --global npm@11.21.1
+      - name: Check release tag
+        if: github.ref_type == 'tag'
+        run: test "v$(node -p "require('./apack.json').version")" = "$GITHUB_REF_NAME"
+      - run: npm run toolchain
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - run: npm ci
+      - run: npm run validate
+      - run: npm run typecheck
+      - run: npm run build -- --release
+      - run: npm run facade:check
+      - run: npm test
+      - run: npm run export -- --out "$RUNNER_TEMP/starter-release"
+      - name: Verify release evidence
+        run: |
+          toolchain=$(node -p "require('./toolchain.lock.json').tag")
+          node ".apack/toolchain/$toolchain/pack-release-evidence.mjs" "$PWD" "$RUNNER_TEMP/starter-release"
+          npx --no-install apack pack release publish --dir "$RUNNER_TEMP/starter-release" --dry-run
+          node -e 'const file = require(process.argv[1]); if (file.provenance?.commit !== process.env.EXPECTED_SOURCE_COMMIT) throw new Error("Archive source does not match this run");' "$RUNNER_TEMP/starter-release/default-setup-$(node -p "require('./apack.json').version").tgz.integrity.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: default-setup-candidate
+          path: ${{ runner.temp }}/starter-release/
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: candidate
+    runs-on: macos-26
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24.22.2
+      - run: npm install --global npm@11.21.1
+      - run: npm run toolchain
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - run: npm ci --ignore-scripts
+      - uses: actions/download-artifact@v4
+        with:
+          name: default-setup-candidate
+          path: ${{ runner.temp }}/starter-release
+      - run: npx --no-install apack pack release publish --dir "$RUNNER_TEMP/starter-release"
+        env:
+          GH_TOKEN: ${{ github.token }}
